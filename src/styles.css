@@ -123,6 +123,16 @@ body:has(.pin) { background: transparent; overflow: hidden; }
 .overlay-root, .overlay-root * { -webkit-user-drag: none; user-select: none; }
 .overlay-root textarea { user-select: text; }
 .frozen-screen { position: absolute; inset: 0; width: 100%; height: 100%; max-width: none; object-fit: fill; pointer-events: none; z-index: 0; }
+.overlay-root:not(.armed) .frozen-screen { filter: brightness(0.58); }
+.overlay-root.armed::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 3px solid #3ddc97;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35), inset 0 0 28px rgba(61, 220, 151, 0.2);
+  z-index: 8;
+  pointer-events: none;
+}
 .anno-layer { position: absolute; inset: 0; z-index: 1; }
 .overlay-root > .stage { position: absolute; inset: 0; z-index: 1; }
 .stage { position: relative; margin: 0 auto; user-select: none; touch-action: none; }
@@ -195,12 +205,16 @@ body:has(.pin) { background: transparent; overflow: hidden; }
 .split { width: 1px; height: 16px; margin: 0 3px; background: #e6e6e6; }
 .swatch { width: 16px; height: 16px; min-width: 16px; padding: 0; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18); }
 .text-draft, .text-draft:focus, .text-draft:focus-visible { position: absolute; z-index: 6; min-width: 8em; min-height: 1.25em; margin: 0; padding: 0; border: 0; border-radius: 0; outline: none; resize: none; overflow: hidden; background: transparent; box-shadow: none; font-family: "Segoe UI", sans-serif; line-height: 1.25; caret-color: currentColor; cursor: text; user-select: text; }
-.pin { width: 100%; height: 100%; display: grid; place-items: center; position: relative; overflow: hidden; }
-.pin img { width: 100%; height: 100%; object-fit: fill; cursor: grab; display: block; }
-.pin p, .pin-menu { position: absolute; left: 8px; bottom: 8px; margin: 0; color: white; background: rgba(16, 16, 16, 0.72); border-radius: 8px; padding: 4px 8px; font-size: 12px; }
-.pin p { opacity: 0; transition: opacity 0.15s ease; }
-.pin:hover p { opacity: 1; }
-.pin-menu { display: flex; gap: 6px; }
+html[data-view="pin"], html[data-view="pin"] body, html[data-view="pin"] #root { background: transparent; }
+.pin { --pin-glow: 22px; width: 100%; height: 100%; position: relative; overflow: hidden; background: transparent; }
+.pin.empty { background: transparent; color: white; }
+.pin.empty.failed { background: #1c1915; display: grid; place-items: center; }
+.pin img { position: absolute; z-index: 1; left: var(--pin-glow); top: var(--pin-glow); width: calc(100% - 2 * var(--pin-glow)); height: calc(100% - 2 * var(--pin-glow)); object-fit: fill; cursor: grab; display: block; }
+/* Soft edge light, painted outside the picture. The margin is the window padding, so the cut itself does not move. */
+.pin-glow { position: absolute; z-index: 2; left: var(--pin-glow); top: var(--pin-glow); width: calc(100% - 2 * var(--pin-glow)); height: calc(100% - 2 * var(--pin-glow)); pointer-events: none; }
+.pin-glow::before { content: ""; position: absolute; inset: -8px; border: 3px solid rgba(96, 170, 255, 0.55); filter: blur(6px); }
+.pin-glow::after { content: ""; position: absolute; inset: -1px; border: 1px solid rgba(198, 226, 255, 0.92); box-shadow: 0 0 6px 1px rgba(88, 168, 255, 0.72), 0 0 14px 2px rgba(64, 146, 255, 0.38); }
+.pin-menu { position: absolute; z-index: 3; left: calc(var(--pin-glow) + 8px); bottom: calc(var(--pin-glow) + 8px); margin: 0; color: white; background: rgba(16, 16, 16, 0.72); border-radius: 8px; padding: 4px 8px; font-size: 12px; display: flex; gap: 6px; }
 .recorder { position: relative; height: 100%; min-height: 96px; width: 100%; display: flex; align-items: center; gap: 10px; padding: 0 14px 18px; background: #1c1915; color: white; }
 .recorder-main { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; cursor: grab; }
 .recorder .dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.22); flex: none; }

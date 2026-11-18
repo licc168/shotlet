@@ -1,7 +1,7 @@
-import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
+import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useRef, useState } from "react";
-import { copyFile, imageSrc, isTauri, pinPath } from "../api";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { copyFile, isTauri, loadImage, pinPath } from "../api";
 import { useI18n } from "../i18n";
 import {
   PIN_MAX_OPACITY,
@@ -10,6 +10,9 @@ import {
   centeredOrigin,
   isDoubleClick,
   nextScale,
+  pinFrameOrigin,
+  pinFrameSize,
+  pinGlowCssPx,
   pinWindowSize,
   type ClickStamp,
 } from "../lib/pin";
@@ -17,6 +20,8 @@ import {
 export function Pin() {
   const { t } = useI18n();
   const [src, setSrc] = useState("");
+  const [file, setFile] = useState("");
+  const [failed, setFailed] = useState("");
   const [scale, setScale] = useState(1);
   const [opacity, setOpacity] = useState(1);
   const [menu, setMenu] = useState(false);
@@ -24,11 +29,35 @@ export function Pin() {
   const naturalRef = useRef<{ w: number; h: number } | null>(null);
   const lastClickRef = useRef<ClickStamp | null>(null);
   const resizeRequestRef = useRef(0);
+  const placedRef = useRef(false);
 
   useEffect(() => {
     const id = new URLSearchParams(location.search).get("id") ?? "";
-    pinPath(id).then(setSrc).catch(() => setSrc(""));
-  }, []);
+    let cancel = false;
+    pinPath(id)
+      .then(async (path) => {
+        if (cancel) return;
+        if (!path) {
+          setFailed(t("empty"));
+          return;
+        }
+        setFile(path);
+        if (path.startsWith("data:") || path.startsWith("blob:") || path.startsWith("http")) {
+          setSrc(path);
+          return;
+        }
+        // asset:// taints or fails to paint inside a transparent pin window.
+        // Same-origin bytes are what the capture overlay already uses.
+        const image = await loadImage(path);
+        if (!cancel) setSrc(image.src);
+      })
+      .catch((reason: unknown) => {
+        if (!cancel) setFailed(reason instanceof Error ? reason.message : String(reason));
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [t]);
 
   useEffect(() => {
     const node = pinRef.current;
@@ -52,21 +81,35 @@ export function Pin() {
   async function fitPinWindow(next: number) {
     const natural = naturalRef.current;
     if (!natural || !isTauri()) return;
-    const target = pinWindowSize(natural.w, natural.h, next);
+    const image = pinWindowSize(natural.w, natural.h, next);
+    // The window is larger than the picture so the edge light can sit outside the cut.
+    const frame = pinFrameSize(image.w, image.h);
     const request = ++resizeRequestRef.current;
     try {
       const win = getCurrentWindow();
-      const factor = await win.scaleFactor();
       if (request !== resizeRequestRef.current) return;
+      // First layout is the screen cut: same pixel size, same top-left.
+      // Later zoom grows around the center. The glow margin stays fixed.
+      if (!placedRef.current) {
+        placedRef.current = true;
+        const params = new URLSearchParams(location.search);
+        const x = Number(params.get("x"));
+        const y = Number(params.get("y"));
+        await win.setSize(new PhysicalSize(frame.w, frame.h));
+        if (request !== resizeRequestRef.current) return;
+        if (params.has("x") && params.has("y") && Number.isFinite(x) && Number.isFinite(y)) {
+          const origin = pinFrameOrigin(Math.round(x), Math.round(y));
+          await win.setPosition(new PhysicalPosition(origin.x, origin.y));
+        }
+        return;
+      }
       const size = await win.innerSize();
       const pos = await win.outerPosition();
       if (request !== resizeRequestRef.current) return;
-      const logicalSize = size.toLogical(factor);
-      const logicalPos = pos.toLogical(factor);
-      const origin = centeredOrigin(logicalPos.x, logicalPos.y, logicalSize.width, logicalSize.height, target.w, target.h);
-      await win.setSize(new LogicalSize(target.w, target.h));
+      const origin = centeredOrigin(pos.x, pos.y, size.width, size.height, frame.w, frame.h);
+      await win.setSize(new PhysicalSize(frame.w, frame.h));
       if (request !== resizeRequestRef.current) return;
-      await win.setPosition(new LogicalPosition(origin.x, origin.y));
+      await win.setPosition(new PhysicalPosition(Math.round(origin.x), Math.round(origin.y)));
     } catch {
       // The pin window may already have been closed.
     }
@@ -97,19 +140,21 @@ export function Pin() {
     void getCurrentWindow().startDragging();
   }
 
-  if (!src) return <main className="pin empty">{t("busy")}</main>;
+  if (!src) return <main className={failed ? "pin empty failed" : "pin empty"}>{failed}</main>;
 
+  const glow = `${pinGlowCssPx(window.devicePixelRatio)}px`;
   return (
     <div
       ref={pinRef}
       className="pin"
-      style={{ opacity }}
+      style={{ opacity, "--pin-glow": glow } as CSSProperties}
       onPointerDown={onPointerDown}
       onDoubleClick={() => void closePin()}
       onContextMenu={(event) => { event.preventDefault(); setMenu(true); }}
     >
+      <div className="pin-glow" aria-hidden="true" />
       <img
-        src={imageSrc(src)}
+        src={src}
         alt=""
         draggable={false}
         onLoad={onImageLoad}
@@ -121,11 +166,10 @@ export function Pin() {
       />
       {menu && (
         <div className="pin-menu">
-          <button onClick={() => void copyFile(src)}>{t("copy")}</button>
+          <button onClick={() => void copyFile(file || src)}>{t("copy")}</button>
           <button onClick={() => void closePin()}>{t("cancel")}</button>
         </div>
       )}
-      <p>{t("hintPin")}</p>
     </div>
   );
 }

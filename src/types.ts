@@ -36,6 +36,7 @@ export type ScreenImage = {
   path: string;
   screenX: number;
   screenY: number;
+  windows?: WindowInfo[];
 };
 
 export type FrozenCapture = {

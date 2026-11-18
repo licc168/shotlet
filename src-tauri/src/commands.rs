@@ -40,8 +40,13 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
     state.overlay_follow.store(false, Ordering::Relaxed);
     let epoch = state.overlay_epoch.fetch_add(1, Ordering::Relaxed) + 1;
     drop(state);
+    ui::on_main_wait(&app, |app| {
+        ui::conceal_overlays(app);
+    })?;
     let mode_for_capture = mode.clone();
     let mut frozen = tauri::async_runtime::spawn_blocking(move || -> Result<FrozenCapture, String> {
+        // Let the previous overlay leave the screen so it is not frozen into the shot.
+        std::thread::sleep(std::time::Duration::from_millis(60));
         let mut frozen = capture::freeze_under_cursor()?;
         match mode_for_capture.as_str() {
             "copy" => frozen.mode = "copy".into(),
@@ -60,23 +65,20 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
         return Ok(());
     }
     let generation = state.overlay_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    drop(state);
     frozen.generation = generation;
-    let screen = frozen.screens.first().cloned().ok_or("没有可显示的屏幕")?;
     let follow = mode != "window" || frozen.preset.is_none();
     let app_for_window = app.clone();
     app.run_on_main_thread(move || {
         let state = app_for_window.state::<AppState>();
-        match state.capture.lock() {
-            Ok(mut slot) => *slot = Some(frozen),
-            Err(error) => {
-                let _ = app_for_window.emit("capture-error", error.to_string());
-                return;
-            }
+        if state.overlay_epoch.load(Ordering::Relaxed) != epoch {
+            return;
         }
-        if let Ok(mut aim) = state.overlay_aim.lock() {
-            *aim = Some((screen.screen_x, screen.screen_y));
+        if let Err(error) = state.capture.lock().map(|mut slot| *slot = Some(frozen.clone())) {
+            let _ = app_for_window.emit("capture-error", error.to_string());
+            return;
         }
-        if let Err(error) = ui::stage_overlay(&app_for_window, &screen, generation) {
+        if let Err(error) = ui::present_overlays(&app_for_window, &frozen, generation) {
             let _ = app_for_window.emit("capture-error", error);
             return;
         }
@@ -86,13 +88,18 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn overlay_ready(app: AppHandle, generation: u64) -> Result<(), String> {
-    ui::reveal_overlay(&app, generation)
+pub fn overlay_ready(window: tauri::WebviewWindow, generation: u64) -> Result<(), String> {
+    ui::reveal_overlay(&window, generation)
 }
 
 #[tauri::command]
 pub fn set_overlay_follow(app: AppHandle, follow: bool) {
     ui::set_overlay_follow(&app, follow);
+}
+
+#[tauri::command]
+pub fn aim_overlay(app: AppHandle, x: i32, y: i32) {
+    ui::aim_overlay_at(&app, x, y);
 }
 
 pub(crate) fn spawn_launch(app: &AppHandle, mode: &'static str) {
@@ -184,7 +191,48 @@ fn storage(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+pub(crate) fn shortcut_log(app: &AppHandle, message: &str) {
+    let stamp = chrono::Local::now().format("%H:%M:%S");
+    let line = format!("[{stamp}] {message}\n");
+    eprint!("shortcuts: {line}");
+    if let Ok(dir) = ui::app_data_dir(app) {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("shotlet.log"))
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+pub(crate) fn register_shortcuts_when_ready(app: &AppHandle) {
+    shortcut_log(app, "event loop ready, registering shortcuts");
+    match ui::read_settings(app) {
+        Ok(settings) => {
+            if let Err(error) = apply_shortcuts(app, &settings) {
+                shortcut_log(app, &format!("register failed: {error}"));
+            }
+        }
+        Err(error) => shortcut_log(app, &format!("read settings failed: {error}")),
+    }
+}
+
 pub fn apply_shortcuts(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = settings;
+        if let Err(error) = app.global_shortcut().unregister_all() {
+            shortcut_log(app, &format!("plugin unregister failed: {error}"));
+        }
+        // Plugin registration during setup reports success, then macOS drops the hotkey.
+        crate::hotkey_mac::schedule_apply(app, true);
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     app.global_shortcut().unregister_all().map_err(err)?;
     let failed = register_missing(app, settings);
     if !failed.is_empty() {
@@ -194,8 +242,10 @@ pub fn apply_shortcuts(app: &AppHandle, settings: &Settings) -> Result<(), Strin
         std::thread::spawn(move || retry_shortcuts(app, failed));
     }
     Ok(())
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn register_missing(app: &AppHandle, settings: &Settings) -> Vec<String> {
     let mut failed = Vec::new();
     for shortcut in shortcut_values(settings) {
@@ -210,6 +260,7 @@ fn register_missing(app: &AppHandle, settings: &Settings) -> Vec<String> {
     failed
 }
 
+#[cfg(not(target_os = "macos"))]
 fn retry_shortcuts(app: AppHandle, mut failed: Vec<String>) {
     for delay_ms in [800, 2000, 4000, 8000] {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -228,7 +279,7 @@ fn retry_shortcuts(app: AppHandle, mut failed: Vec<String>) {
     let _ = app.emit("capture-error", message);
 }
 
-fn shortcut_values(settings: &Settings) -> [&str; 8] {
+pub(crate) fn shortcut_values(settings: &Settings) -> [&str; 8] {
     [
         settings.capture_shortcut.as_str(),
         settings.capture_copy_shortcut.as_str(),
@@ -241,6 +292,7 @@ fn shortcut_values(settings: &Settings) -> [&str; 8] {
     ]
 }
 
+#[cfg(not(target_os = "macos"))]
 fn register(app: &AppHandle, text: &str) -> Result<(), String> {
     let parsed: Shortcut = text.parse().map_err(err)?;
     app.global_shortcut().register(parsed).map_err(err)
@@ -378,22 +430,41 @@ pub fn copy_png_base64(data: String) -> Result<(), String> {
     util::copy_rgba(&image)
 }
 
-#[tauri::command]
-pub fn pin_file(app: AppHandle, path: String, x: i32, y: i32) -> Result<(), String> {
-    ui::open_pin(&app, path, x, y)
+fn round_i32(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
 #[tauri::command]
-pub async fn pin_png_base64(app: AppHandle, data: String, x: i32, y: i32) -> Result<(), String> {
-    let path = tauri::async_runtime::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+pub fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<(), String> {
+    let x = round_i32(x);
+    let y = round_i32(y);
+    let image = util::read_png_file(std::path::Path::new(&path))?;
+    eprintln!("pin: file {path} at {x},{y} ({}x{})", image.width(), image.height());
+    ui::open_pin(&app, path, x, y, image.width(), image.height())
+}
+
+#[tauri::command]
+pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Result<(), String> {
+    // Selection math is fractional. serde rejects a JSON float for i32, so the
+    // command never ran and no pin file was written. Round here.
+    let x = round_i32(x);
+    let y = round_i32(y);
+    eprintln!("pin: png bytes={} at {x},{y}", data.len());
+    let (path, width, height) = tauri::async_runtime::spawn_blocking(move || -> Result<(std::path::PathBuf, u32, u32), String> {
         let image = util::load_rgba(&util::decode_png(&data)?)?;
         let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
         util::write_png(&path, &image)?;
-        Ok(path)
+        eprintln!("pin: wrote {} ({}x{})", path.display(), image.width(), image.height());
+        Ok((path, image.width(), image.height()))
     })
     .await
     .map_err(err)??;
-    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y)
+    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?;
+    eprintln!("pin: window queued");
+    Ok(())
 }
 
 #[tauri::command]
@@ -421,9 +492,12 @@ pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
         .await
         .map_err(err)??;
     let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
+    let width = image.width();
+    let height = image.height();
     util::write_png(&path, &image)?;
     let (x, y) = capture::cursor_point().unwrap_or((120, 120));
-    ui::open_pin(app, path.to_string_lossy().to_string(), x, y)?;
+    eprintln!("pin: clipboard {} at {x},{y} ({width}x{height})", path.display());
+    ui::open_pin(app, path.to_string_lossy().to_string(), x, y, width, height)?;
     let _ = app.emit("capture-error", "已贴图");
     Ok(())
 }
@@ -437,6 +511,23 @@ pub fn pin_path(state: State<AppState>, id: String) -> Result<String, String> {
         .get(&id)
         .cloned()
         .ok_or_else(|| "贴图已经失效".into())
+}
+
+
+#[tauri::command]
+pub fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+    let path = std::path::Path::new(&path);
+    let meta = std::fs::metadata(path).map_err(err)?;
+    if !meta.is_file() {
+        return Err("找不到截图".into());
+    }
+    // Full-screen retina captures stay well under this. Reject anything else
+    // before it is copied into the webview.
+    if meta.len() > 80 * 1024 * 1024 {
+        return Err("截图太大，无法显示".into());
+    }
+    let bytes = std::fs::read(path).map_err(err)?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -479,6 +570,10 @@ pub fn current_editor(state: State<AppState>) -> Result<Option<EditorView>, Stri
 
 #[tauri::command]
 pub async fn scroll_capture(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<EditorView, String> {
+    if let Err(error) = scroll::ensure_scroll_access() {
+        let _ = app.emit("capture-error", error.clone());
+        return Err(error);
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let app_hide = app.clone();
     app.run_on_main_thread(move || {
@@ -487,10 +582,17 @@ pub async fn scroll_capture(app: AppHandle, x: i32, y: i32, width: u32, height: 
     })
     .map_err(err)?;
     let _ = rx.recv();
-    std::thread::sleep(std::time::Duration::from_millis(120));
-    let result = tauri::async_runtime::spawn_blocking(move || scroll::capture_scrolled(x, y, width, height))
-        .await
-        .map_err(err)??;
+    std::thread::sleep(std::time::Duration::from_millis(190));
+    let captured = tauri::async_runtime::spawn_blocking(move || scroll::capture_scrolled(x, y, width, height)).await;
+    let result = match captured.map_err(err).and_then(|inner| inner) {
+        Ok(result) => result,
+        Err(error) => {
+            ui::close_overlay(&app);
+            let _ = app.emit("capture-error", error.clone());
+            ui::open_home(&app);
+            return Err(error);
+        }
+    };
     let view = EditorView {
         record_id: None,
         path: result.path.clone(),

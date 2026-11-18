@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct OverlayPlace {
+    pub label: String,
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    pub point_width: u32,
+    pub point_height: u32,
     pub generation: u64,
 }
 
@@ -36,7 +39,7 @@ pub struct AppState {
     pub overlay_epoch: AtomicU64,
     pub overlay_generation: AtomicU64,
     pub overlay_aim: Mutex<Option<(i32, i32)>>,
-    pub overlay_pending: Mutex<Option<OverlayPlace>>,
+    pub overlay_pending: Mutex<Vec<OverlayPlace>>,
 }
 
 impl AppState {
@@ -54,7 +57,7 @@ impl AppState {
             overlay_epoch: AtomicU64::new(1),
             overlay_generation: AtomicU64::new(1),
             overlay_aim: Mutex::new(None),
-            overlay_pending: Mutex::new(None),
+            overlay_pending: Mutex::new(Vec::new()),
         }
     }
 }

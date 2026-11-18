@@ -35,10 +35,31 @@ pub fn recognize_png_bytes(bytes: &[u8]) -> Result<String, String> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("文字识别中断".into()),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let bytes = bytes.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("shotlet-ocr".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recognize_macos(&bytes)));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => Err("文字识别中断".into()),
+                };
+                let _ = tx.send(result);
+            })
+            .map_err(err)?;
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("文字识别超时".into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("文字识别中断".into()),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = bytes;
-        Err("这个版本的 OCR 只在 Windows 上使用系统识别引擎".into())
+        Err("这个版本的 OCR 只在 Windows 和 macOS 上使用系统识别引擎".into())
     }
 }
 
@@ -156,6 +177,65 @@ fn ocr_engine() -> Result<windows::Media::Ocr::OcrEngine, String> {
     OcrEngine::TryCreateFromLanguage(&language).map_err(err)
 }
 
+
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, c_char};
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn shotlet_recognize_rgba(
+        pixels: *const u8,
+        width: u32,
+        height: u32,
+        bytes_per_row: u32,
+        error_out: *mut *mut c_char,
+    ) -> *mut c_char;
+    fn shotlet_ocr_free(ptr: *mut c_char);
+}
+
+#[cfg(target_os = "macos")]
+fn recognize_macos(png: &[u8]) -> Result<String, String> {
+    let image = crate::util::load_rgba(png)?;
+    let image = fit_within(image, 4096);
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Ok(String::new());
+    }
+    let bytes_per_row = width.checked_mul(4).ok_or("图片太大，无法识别")?;
+    let mut pixels = image.into_raw();
+    for alpha in pixels.iter_mut().skip(3).step_by(4) {
+        *alpha = 255;
+    }
+
+    struct OwnedC(*mut c_char);
+    impl Drop for OwnedC {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { shotlet_ocr_free(self.0) }
+            }
+        }
+    }
+
+    let mut error = std::ptr::null_mut();
+    let text = unsafe {
+        shotlet_recognize_rgba(pixels.as_ptr(), width, height, bytes_per_row, &mut error)
+    };
+    let error = OwnedC(error);
+    let text = OwnedC(text);
+    if !error.0.is_null() {
+        let message = unsafe { CStr::from_ptr(error.0) }.to_string_lossy();
+        return Err(if message.is_empty() {
+            "文字识别失败".into()
+        } else {
+            message.into_owned()
+        });
+    }
+    if text.0.is_null() {
+        return Err("文字识别失败".into());
+    }
+    Ok(unsafe { CStr::from_ptr(text.0) }.to_string_lossy().trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::fit_within;
@@ -197,6 +277,74 @@ $g.Dispose(); $bmp.Dispose()
             .output()
             .expect("powershell");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let bytes = std::fs::read(&path).expect("sample png");
+        let text = super::recognize_png_bytes(&bytes).expect("ocr");
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("hello") || lower.contains("ocr") || text.contains("128") || text.contains("识别") || text.contains("测试"),
+            "unexpected ocr text: {text:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recognizes_drawn_text() {
+        let path = std::env::temp_dir().join("shotlet-ocr-sample.png");
+        let script_path = std::env::temp_dir().join("shotlet-ocr-sample.swift");
+        let script = r#"
+import AppKit
+
+let width = 1200
+let height = 420
+guard let rep = NSBitmapImageRep(
+    bitmapDataPlanes: nil,
+    pixelsWide: width,
+    pixelsHigh: height,
+    bitsPerSample: 8,
+    samplesPerPixel: 4,
+    hasAlpha: true,
+    isPlanar: false,
+    colorSpaceName: .deviceRGB,
+    bytesPerRow: 0,
+    bitsPerPixel: 0
+) else {
+    fputs("bitmap failed\n", stderr)
+    exit(1)
+}
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+NSColor.white.setFill()
+NSRect(x: 0, y: 0, width: width, height: height).fill()
+let font = NSFont(name: "PingFangSC-Regular", size: 64) ?? NSFont.systemFont(ofSize: 64)
+let attrs: [NSAttributedString.Key: Any] = [
+    .font: font,
+    .foregroundColor: NSColor.black,
+]
+("Hello OCR 128" as NSString).draw(at: NSPoint(x: 48, y: 230), withAttributes: attrs)
+("识别测试" as NSString).draw(at: NSPoint(x: 48, y: 90), withAttributes: attrs)
+NSGraphicsContext.restoreGraphicsState()
+guard let png = rep.representation(using: .png, properties: [:]) else {
+    fputs("png failed\n", stderr)
+    exit(1)
+}
+do {
+    try png.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+} catch {
+    fputs("write failed\n", stderr)
+    exit(1)
+}
+"#;
+        std::fs::write(&script_path, script).expect("swift script");
+        let output = std::process::Command::new("xcrun")
+            .args(["--sdk", "macosx", "swift", script_path.to_str().expect("swift path"), path.to_str().expect("png path")])
+            .output()
+            .expect("swift");
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let bytes = std::fs::read(&path).expect("sample png");
         let text = super::recognize_png_bytes(&bytes).expect("ocr");
         let lower = text.to_lowercase();

@@ -1,4 +1,6 @@
 mod capture;
+#[cfg(target_os = "macos")]
+mod hotkey_mac;
 mod commands;
 mod history;
 mod ocr;
@@ -13,7 +15,7 @@ mod ui;
 mod util;
 mod windows_list;
 
-use tauri::{Manager, WindowEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
 
 use crate::state::AppState;
@@ -38,6 +40,7 @@ pub fn run() {
             commands::start_capture,
             commands::overlay_ready,
             commands::set_overlay_follow,
+            commands::aim_overlay,
             commands::copy_capture_region,
             commands::current_capture,
             commands::cancel_capture,
@@ -61,6 +64,7 @@ pub fn run() {
             commands::pin_file,
             commands::pin_png_base64,
             commands::pin_path,
+            commands::read_image_bytes,
             commands::ocr_png_base64,
             commands::open_editor_record,
             commands::current_editor,
@@ -82,9 +86,9 @@ pub fn run() {
             if let Err(error) = ui::install_tray(app.handle()) {
                 eprintln!("tray: {error}");
             }
-            if let Err(error) = commands::apply_shortcuts(app.handle(), &preferences) {
-                eprintln!("shortcuts: {error}");
-            }
+            #[cfg(target_os = "macos")]
+            capture::prepare_capture_access();
+            commands::shortcut_log(app.handle(), "setup complete");
             if let Err(error) = ui::prepare_overlay(app.handle()) {
                 eprintln!("overlay: {error}");
             }
@@ -106,6 +110,13 @@ pub fn run() {
                 _ => {}
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Shotlet");
+        .build(tauri::generate_context!())
+        .expect("error while building Shotlet")
+        .run(|app, event| {
+            if let RunEvent::Ready = event {
+                // Carbon hotkeys registered before NSApp is running come back as success
+                // and then get dropped. Register only once the event loop is up.
+                commands::register_shortcuts_when_ready(app);
+            }
+        });
 }

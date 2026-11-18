@@ -83,7 +83,6 @@ const copy = {
   ocrCopied: ["已复制识别出的文字", "Copied the recognized text"],
   hintPick: ["拖出区域后松手。按住 Shift 为正方形，双击窗口直接选中，Esc 取消。", "Drag a region and release. Shift makes a square, double-click selects a window, Esc cancels."],
   hintCopy: ["拖出区域后会直接复制到剪贴板。", "Release to copy the region to the clipboard."],
-  hintPin: ["滚轮缩放，按住 Ctrl 滚轮调整透明度，双击关闭。", "Scroll to zoom, Ctrl-scroll to fade, double-click to close."],
   recording: ["正在录制", "Recording"],
   stop: ["停止", "Stop"],
   crop: ["裁剪", "Crop"],

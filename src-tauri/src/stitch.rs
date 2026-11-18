@@ -4,6 +4,7 @@ use image::Rgba;
 
 /// Append the newly revealed rows when `next` is the same region after a downward scroll.
 /// `next[0]` is expected to line up with `prev[shift]`.
+#[cfg(test)]
 pub fn append_scrolled(prev: &RgbaImage, next: &RgbaImage) -> (RgbaImage, bool) {
     if prev.width() != next.width() || prev.height() < 8 || next.height() < 8 {
         return (prev.clone(), false);
@@ -29,6 +30,7 @@ pub fn append_scrolled(prev: &RgbaImage, next: &RgbaImage) -> (RgbaImage, bool) 
     (out, true)
 }
 
+#[cfg(test)]
 fn best_shift(prev: &RgbaImage, next: &RgbaImage) -> Option<u32> {
     let height = prev.height().min(next.height());
     let max_shift = height / 2;
@@ -84,6 +86,164 @@ fn row_diff(prev: &RgbaImage, prev_y: u32, next: &RgbaImage, next_y: u32) -> i64
     if count == 0 { 0 } else { total / count }
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMotion {
+    Down,
+    Up,
+    Still,
+}
+
+/// True when two captures of the same viewport have settled.
+pub fn frames_stable(prev: &RgbaImage, next: &RgbaImage) -> bool {
+    if prev.dimensions() != next.dimensions() || prev.width() == 0 || prev.height() == 0 {
+        return false;
+    }
+    let samples = 12u32.min(prev.height());
+    let mut total = 0i64;
+    for index in 0..samples {
+        let y = index * prev.height() / samples;
+        let diff = row_diff(prev, y, next, y);
+        if diff > 3 {
+            return false;
+        }
+        total += diff;
+    }
+    total / i64::from(samples) <= 2
+}
+
+/// How many new rows appeared at the bottom of `next` after a downward scroll.
+/// `expected` breaks a near tie; a real ambiguity returns `None` so a strip is not repeated.
+pub fn revealed_rows(prev: &RgbaImage, next: &RgbaImage, expected: Option<u32>) -> Option<u32> {
+    choose_shift(&down_candidates(prev, next), expected).map(|score| score.shift)
+}
+
+pub fn scroll_motion(prev: &RgbaImage, next: &RgbaImage) -> ScrollMotion {
+    let down_scores = down_candidates(prev, next);
+    let up_scores = up_candidates(prev, next);
+    let down = leading(&down_scores);
+    let up = leading(&up_scores);
+    match (down, up) {
+        (Some(down), Some(up)) if clearly_more(down, up) => ScrollMotion::Down,
+        (Some(down), Some(up)) if clearly_more(up, down) => ScrollMotion::Up,
+        (Some(_), Some(_)) => ScrollMotion::Still,
+        (Some(_), None) => ScrollMotion::Down,
+        (None, Some(_)) => ScrollMotion::Up,
+        (None, None) => ScrollMotion::Still,
+    }
+}
+
+/// Append `rows` under `base`. Widths must match; an empty strip leaves `base` unchanged.
+pub fn append_rows(base: &RgbaImage, rows: &RgbaImage) -> RgbaImage {
+    if rows.height() == 0 || rows.width() != base.width() {
+        return base.clone();
+    }
+    let mut out = RgbaImage::new(base.width(), base.height().saturating_add(rows.height()));
+    for y in 0..base.height() {
+        for x in 0..base.width() {
+            out.put_pixel(x, y, *base.get_pixel(x, y));
+        }
+    }
+    for y in 0..rows.height() {
+        for x in 0..rows.width() {
+            out.put_pixel(x, base.height() + y, *rows.get_pixel(x, y));
+        }
+    }
+    out
+}
+
+struct ShiftScore {
+    shift: u32,
+    support: u32,
+    error: i64,
+}
+
+fn clearly_more(better: &ShiftScore, other: &ShiftScore) -> bool {
+    better.support > other.support.saturating_add(other.support / 5).max(other.support.saturating_add(1))
+}
+
+fn down_candidates(prev: &RgbaImage, next: &RgbaImage) -> Vec<ShiftScore> {
+    shift_candidates(prev, next, true)
+}
+
+fn up_candidates(prev: &RgbaImage, next: &RgbaImage) -> Vec<ShiftScore> {
+    shift_candidates(prev, next, false)
+}
+
+fn shift_candidates(prev: &RgbaImage, next: &RgbaImage, downward: bool) -> Vec<ShiftScore> {
+    if prev.width() != next.width() || prev.height() < 8 || next.height() < 8 || prev.height() != next.height() {
+        return Vec::new();
+    }
+    let height = prev.height();
+    let max_shift = (height * 2 / 3).min(height.saturating_sub(4));
+    if max_shift < 2 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for shift in 2..max_shift {
+        let overlap_start = if downward { 0 } else { shift };
+        let overlap_end = if downward { height - shift } else { height };
+        if overlap_end <= overlap_start {
+            continue;
+        }
+        let span = overlap_end - overlap_start;
+        let step = if height <= 240 { 1 } else { (span / 80).max(1) };
+        let mut support = 0u32;
+        let mut error = 0i64;
+        let mut y = overlap_start;
+        while y < overlap_end {
+            let prev_y = if downward { y + shift } else { y - shift };
+            if let Some(diff) = aligned_support(prev, next, prev_y, y) {
+                support += 1;
+                error += diff;
+            }
+            y += step;
+        }
+        if support >= 3 {
+            found.push(ShiftScore {
+                shift,
+                support,
+                error: error / i64::from(support),
+            });
+        }
+    }
+    found
+}
+
+/// A row counts only when it actually moved, and lines up after `shift` (difference <= 20).
+fn aligned_support(prev: &RgbaImage, next: &RgbaImage, prev_y: u32, next_y: u32) -> Option<i64> {
+    let aligned = row_diff(prev, prev_y, next, next_y);
+    if aligned > 20 {
+        return None;
+    }
+    let unaligned = row_diff(prev, next_y, next, next_y);
+    if unaligned < 40 || unaligned < aligned.saturating_add(24) {
+        return None;
+    }
+    Some(aligned)
+}
+
+fn leading(candidates: &[ShiftScore]) -> Option<&ShiftScore> {
+    candidates.iter().max_by(|left, right| {
+        left.support.cmp(&right.support).then(right.error.cmp(&left.error)).then(right.shift.cmp(&left.shift))
+    })
+}
+
+fn choose_shift(candidates: &[ShiftScore], expected: Option<u32>) -> Option<&ShiftScore> {
+    let best = leading(candidates)?.support;
+    let close: Vec<&ShiftScore> = candidates
+        .iter()
+        .filter(|score| score.support + 1 >= best || score.support.saturating_mul(10) >= best.saturating_mul(9))
+        .collect();
+    if close.len() == 1 {
+        return Some(close[0]);
+    }
+    let expected = expected?;
+    let nearest = close.iter().map(|score| score.shift.abs_diff(expected)).min()?;
+    let tied: Vec<&ShiftScore> = close.into_iter().filter(|score| score.shift.abs_diff(expected) == nearest).collect();
+    if tied.len() == 1 { Some(tied[0]) } else { None }
+}
+
 #[cfg(test)]
 fn solid(width: u32, height: u32, color_at: impl Fn(u32, u32) -> Rgba<u8>) -> RgbaImage {
     let mut image = RgbaImage::new(width, height);
@@ -118,5 +278,68 @@ mod tests {
         let (same, grew) = append_scrolled(&prev, &next);
         assert!(!grew);
         assert_eq!(same.height(), prev.height());
+    }
+
+    #[test]
+    fn stitches_two_viewport_steps() {
+        let full = solid(30, 70, |_x, y| Rgba([(y * 17) as u8, (y * 13) as u8, (y * 9) as u8, 255]));
+        let first = image::imageops::crop_imm(&full, 0, 0, 30, 40).to_image();
+        let second = image::imageops::crop_imm(&full, 0, 15, 30, 40).to_image();
+        let third = image::imageops::crop_imm(&full, 0, 30, 30, 40).to_image();
+        let step_a = revealed_rows(&first, &second, None).unwrap();
+        let step_b = revealed_rows(&second, &third, Some(15)).unwrap();
+        assert_eq!(step_a, 15);
+        assert_eq!(step_b, 15);
+        let mut stitched = append_rows(&first, &image::imageops::crop_imm(&second, 0, second.height() - step_a, 30, step_a).to_image());
+        stitched = append_rows(&stitched, &image::imageops::crop_imm(&third, 0, third.height() - step_b, 30, step_b).to_image());
+        assert_eq!(stitched.height(), 70);
+        assert_eq!(stitched.get_pixel(4, 0), full.get_pixel(4, 0));
+        assert_eq!(stitched.get_pixel(4, 69), full.get_pixel(4, 69));
+    }
+
+    #[test]
+    fn identical_and_unrelated_frames_do_not_grow() {
+        let prev = solid(20, 40, |_x, y| Rgba([(y * 17) as u8, 10, 30, 255]));
+        let same = prev.clone();
+        assert!(revealed_rows(&prev, &same, None).is_none());
+        assert_eq!(scroll_motion(&prev, &same), ScrollMotion::Still);
+        assert!(frames_stable(&prev, &same));
+        let unrelated = solid(20, 40, |_x, y| Rgba([0, (y * 13) as u8, 200, 255]));
+        assert!(revealed_rows(&prev, &unrelated, Some(12)).is_none());
+        assert!(!frames_stable(&prev, &unrelated));
+        let kept = append_rows(&prev, &image::RgbaImage::new(prev.width(), 0));
+        assert_eq!(kept.height(), prev.height());
+    }
+
+    #[test]
+    fn detects_an_upward_scroll() {
+        let full = solid(30, 70, |_x, y| Rgba([(y * 17) as u8, (y * 13) as u8, (y * 9) as u8, 255]));
+        let prev = image::imageops::crop_imm(&full, 0, 15, 30, 40).to_image();
+        let next = image::imageops::crop_imm(&full, 0, 0, 30, 40).to_image();
+        assert_eq!(scroll_motion(&prev, &next), ScrollMotion::Up);
+        assert!(revealed_rows(&prev, &next, Some(15)).is_none());
+    }
+
+    #[test]
+    fn stitches_past_a_sticky_header() {
+        let frame = |scroll: u32| {
+            solid(24, 40, move |_x, y| {
+                if y < 10 {
+                    Rgba([20, 30, 40, 255])
+                } else {
+                    let row = y - 10 + scroll;
+                    Rgba([(row * 17) as u8, (row * 13) as u8, (row * 9) as u8, 255])
+                }
+            })
+        };
+        let prev = frame(0);
+        let next = frame(14);
+        assert_eq!(scroll_motion(&prev, &next), ScrollMotion::Down);
+        assert_eq!(revealed_rows(&prev, &next, Some(14)), Some(14));
+        let strip = image::imageops::crop_imm(&next, 0, next.height() - 14, 24, 14).to_image();
+        let stitched = append_rows(&prev, &strip);
+        assert_eq!(stitched.height(), 54);
+        assert_eq!(stitched.get_pixel(0, 0), prev.get_pixel(0, 0));
+        assert_eq!(stitched.get_pixel(3, 53), next.get_pixel(3, 39));
     }
 }

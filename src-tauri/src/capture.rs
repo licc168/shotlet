@@ -26,9 +26,17 @@ pub struct ScreenImage {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// Logical points on macOS, physical pixels on Windows. Window placement uses this, not `width`.
+    #[serde(default)]
+    pub point_width: u32,
+    #[serde(default)]
+    pub point_height: u32,
     pub path: String,
     pub screen_x: i32,
     pub screen_y: i32,
+    /// Window rects in this screen's local coordinates. `x` above is the packed crop origin, not a window origin.
+    #[serde(default)]
+    pub windows: Vec<WindowInfo>,
 }
 
 #[derive(Clone, Serialize)]
@@ -83,54 +91,78 @@ pub fn monitor_at_point(rects: &[MonitorRect], x: i32, y: i32) -> Option<Monitor
         .find(|rect| x >= rect.x && y >= rect.y && x < rect.x + rect.width as i32 && y < rect.y + rect.height as i32)
 }
 
+fn intersects_local(x: i32, y: i32, w: i32, h: i32, width: i32, height: i32) -> bool {
+    if w <= 0 || h <= 0 || width <= 0 || height <= 0 {
+        return false;
+    }
+    let x0 = i64::from(x);
+    let y0 = i64::from(y);
+    let x1 = x0 + i64::from(w);
+    let y1 = y0 + i64::from(h);
+    x1 > 0 && y1 > 0 && x0 < i64::from(width) && y0 < i64::from(height)
+}
+
 pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
+    ensure_screen_capture()?;
     let (cursor_x, cursor_y) = cursor_point().ok_or("无法读取鼠标位置")?;
-    let monitors = Monitor::all().map_err(err)?;
+    let mut monitors = Monitor::all().map_err(err)?;
     if monitors.is_empty() {
         return Err("没有找到显示器".into());
     }
-    let mut chosen = 0usize;
-    for (index, monitor) in monitors.iter().enumerate() {
-        let Ok(x) = monitor.x() else { continue };
-        let Ok(y) = monitor.y() else { continue };
-        let Ok(width) = monitor.width() else { continue };
-        let Ok(height) = monitor.height() else { continue };
-        if cursor_x >= x && cursor_y >= y && cursor_x < x + width as i32 && cursor_y < y + height as i32 {
-            chosen = index;
-            break;
+    monitors.sort_by_key(|monitor| (monitor.x().unwrap_or(i32::MAX), monitor.y().unwrap_or(i32::MAX)));
+    let mut screens = Vec::new();
+    let mut packed_x: i32 = 0;
+    let mut chosen: Option<usize> = None;
+    for monitor in monitors {
+        let Ok(sx) = monitor.x() else { continue };
+        let Ok(sy) = monitor.y() else { continue };
+        let Ok(point_w) = monitor.width() else { continue };
+        let Ok(point_h) = monitor.height() else { continue };
+        if point_w == 0 || point_h == 0 {
+            continue;
         }
+        let Ok(image) = monitor.capture_image() else { continue };
+        let width = image.width();
+        let height = image.height();
+        if width == 0 || height == 0 || width > 20000 || height > 20000 {
+            continue;
+        }
+        let path = capture_dir().join(format!("freeze-{}.png", new_id()));
+        write_png(&path, &image)?;
+        // Window positions share the monitor's point space, which is not the packed crop origin.
+        let mut windows = windows_list::list_windows(sx, sy, point_w as i32, point_h as i32);
+        windows.retain(|window| intersects_local(window.x, window.y, window.width, window.height, point_w as i32, point_h as i32));
+        if cursor_x >= sx && cursor_y >= sy && cursor_x < sx + point_w as i32 && cursor_y < sy + point_h as i32 {
+            chosen = Some(screens.len());
+        }
+        screens.push(ScreenImage {
+            x: packed_x,
+            y: 0,
+            width,
+            height,
+            point_width: point_w,
+            point_height: point_h,
+            path: path.to_string_lossy().to_string(),
+            screen_x: sx,
+            screen_y: sy,
+            windows,
+        });
+        packed_x = packed_x.saturating_add(width as i32);
     }
-    let monitor = monitors.into_iter().nth(chosen).ok_or("没有找到显示器")?;
-    let x = monitor.x().map_err(err)?;
-    let y = monitor.y().map_err(err)?;
-    let image = monitor.capture_image().map_err(err)?;
-    let width = image.width();
-    let height = image.height();
-    if width == 0 || height == 0 || width > 20000 || height > 20000 {
-        return Err("屏幕尺寸无效".into());
+    if screens.is_empty() {
+        return Err("没有找到显示器".into());
     }
-    let path = capture_dir().join(format!("freeze-{}.png", new_id()));
-    write_png(&path, &image)?;
-    let windows = windows_list::list_windows(x, y, width as i32, height as i32);
-    let screen = ScreenImage {
-        x: 0,
-        y: 0,
-        width,
-        height,
-        path: path.to_string_lossy().to_string(),
-        screen_x: x,
-        screen_y: y,
-    };
+    let primary = screens[chosen.unwrap_or(0)].clone();
     Ok(FrozenCapture {
-        path: screen.path.clone(),
-        width,
-        height,
-        origin_x: x,
-        origin_y: y,
-        windows,
+        path: primary.path.clone(),
+        width: primary.width,
+        height: primary.height,
+        origin_x: primary.screen_x,
+        origin_y: primary.screen_y,
+        windows: primary.windows.clone(),
         mode: default_mode(),
         preset: None,
-        screens: vec![screen],
+        screens,
         generation: 0,
     })
 }
@@ -192,10 +224,76 @@ pub fn cursor_point() -> Option<(i32, i32)> {
         }
         None
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_cursor_point()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }
+}
+
+/// Ask for Screen Recording on the main thread. Capture itself only checks.
+#[cfg(target_os = "macos")]
+pub fn prepare_capture_access() {
+    unsafe {
+        if !CGPreflightScreenCaptureAccess() {
+            let _ = CGRequestScreenCaptureAccess();
+        }
+    }
+}
+
+pub fn ensure_screen_capture() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { CGPreflightScreenCaptureAccess() } {
+            return Ok(());
+        }
+        return Err("没有屏幕录制权限。请到系统设置 → 隐私与安全性 → 屏幕录制，允许 Shotlet 后再按 F1。".into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cursor_point() -> Option<(i32, i32)> {
+    unsafe {
+        let event = CGEventCreate(std::ptr::null_mut());
+        if event.is_null() {
+            return None;
+        }
+        let point = CGEventGetLocation(event);
+        CFRelease(event as *const std::ffi::c_void);
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        Some((point.x.round() as i32, point.y.round() as i32))
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CgPoint {
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventCreate(source: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CgPoint;
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const std::ffi::c_void);
 }
 
 pub fn crop_frozen(image: &RgbaImage, x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage, String> {
@@ -259,6 +357,25 @@ mod tests {
         let cropped = crop_frozen(&image, -2, -2, 6, 5).unwrap();
         assert_eq!(cropped.dimensions(), (4, 3));
         assert!(crop_frozen(&image, 20, 20, 4, 4).is_err());
+    }
+
+    #[test]
+    fn local_window_keeps_only_the_intersection() {
+        assert!(super::intersects_local(-20, 10, 40, 30, 100, 80));
+        assert!(!super::intersects_local(100, 0, 40, 30, 100, 80));
+        assert!(!super::intersects_local(10, 90, 20, 20, 100, 80));
+        assert!(!super::intersects_local(10, 10, 0, 20, 100, 80));
+    }
+
+    #[test]
+    fn monitor_at_point_hits_the_display_under_the_cursor() {
+        let rects = vec![
+            super::MonitorRect { x: 0, y: 0, width: 1920, height: 1080 },
+            super::MonitorRect { x: 1920, y: 0, width: 1920, height: 1080 },
+        ];
+        assert_eq!(super::monitor_at_point(&rects, 2000, 40).unwrap().x, 1920);
+        assert_eq!(super::monitor_at_point(&rects, 1919, 1079).unwrap().x, 0);
+        assert!(super::monitor_at_point(&rects, 1920, 1080).is_none());
     }
 
     #[test]

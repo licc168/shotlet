@@ -84,6 +84,11 @@ export async function setOverlayFollow(follow: boolean): Promise<void> {
   await call("set_overlay_follow", { follow });
 }
 
+export async function aimOverlay(x: number, y: number): Promise<void> {
+  if (!isTauri()) return;
+  await call("aim_overlay", { x, y });
+}
+
 export async function currentCapture(): Promise<FrozenCapture | null> {
   if (!isTauri()) return demoCapture();
   return call<FrozenCapture | null>("current_capture");
@@ -376,10 +381,26 @@ export async function pickDirectory(): Promise<string | null> {
 export function loadImage(path: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image();
+    image.onload = () => {
+      const src = image.src;
+      resolve(image);
+      if (src.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(src), 60_000);
+    };
+    image.onerror = () => reject(new Error("image"));
+    // macOS serves local captures through asset://. Drawing that URL taints the
+    // canvas, so color sampling and OCR export fail with SecurityError. Read the
+    // file bytes and use a same-origin blob instead.
+    if (isTauri() && path && !path.startsWith("data:") && !path.startsWith("blob:") && !path.startsWith("http")) {
+      call<ArrayBuffer | Uint8Array>("read_image_bytes", { path })
+        .then((bytes) => {
+          const copy = bytes instanceof Uint8Array ? new Uint8Array(bytes) : new Uint8Array(bytes);
+          image.src = URL.createObjectURL(new Blob([copy], { type: "image/png" }));
+        })
+        .catch((error: unknown) => reject(error instanceof Error ? error : new Error(String(error))));
+      return;
+    }
     const src = imageSrc(path);
     if (src.startsWith("http")) image.crossOrigin = "anonymous";
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("image"));
     image.src = src;
   });
 }

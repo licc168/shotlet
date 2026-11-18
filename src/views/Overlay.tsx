@@ -1,14 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 import { Annotator } from "../editor/Annotator";
-import { cancelCapture, commitHistory, copyCaptureRegion, copyPngBase64, currentCapture, ffmpegAvailable, isTauri, loadImage, ocrPngBase64, onEvent, overlayReady, pinPngBase64, pickSavePath, scrollCapture, setOverlayFollow, startRecording, writePngBase64 } from "../api";
+import { aimOverlay, cancelCapture, commitHistory, copyCaptureRegion, copyPngBase64, currentCapture, ffmpegAvailable, isTauri, loadImage, ocrPngBase64, onEvent, overlayReady, pinPngBase64, pickSavePath, scrollCapture, setOverlayFollow, startRecording, writePngBase64 } from "../api";
 import { useI18n } from "../i18n";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
 import type { FrozenCapture, ScreenImage, WindowInfo } from "../types";
 
-function screenOf(capture: FrozenCapture): ScreenImage {
-  const found = capture.screens?.find((item) => item.path) ?? capture.screens?.[0];
-  if (found?.path) return found;
-  return { x: 0, y: 0, width: capture.width, height: capture.height, path: capture.path, screenX: capture.originX, screenY: capture.originY };
+function overlaySlot(): number {
+  const raw = new URLSearchParams(window.location.search).get("slot");
+  const slot = raw ? Number(raw) : 0;
+  return Number.isFinite(slot) && slot >= 0 ? Math.floor(slot) : 0;
+}
+
+function screenOf(capture: FrozenCapture, slot: number): ScreenImage | null {
+  const screens = capture.screens ?? [];
+  if (screens.length === 0) {
+    if (slot !== 0) return null;
+    return { x: 0, y: 0, width: capture.width, height: capture.height, path: capture.path, screenX: capture.originX, screenY: capture.originY };
+  }
+  const found = screens[slot];
+  return found?.path ? found : null;
+}
+
+function isCursorScreen(capture: FrozenCapture, screen: ScreenImage): boolean {
+  return screen.screenX === capture.originX && screen.screenY === capture.originY;
 }
 
 export function Overlay() {
@@ -26,10 +40,16 @@ export function Overlay() {
   const stopDragListen = useRef<(() => void) | null>(null);
   const draftRef = useRef<Rect | null>(null);
   const copying = useRef(false);
+  const scrolling = useRef(false);
   const loupeRef = useRef<HTMLCanvasElement>(null);
   const raf = useRef(0);
   const pendingPoint = useRef<{ x: number; y: number } | null>(null);
   const sampleRef = useRef<HTMLCanvasElement | null>(null);
+  const ownsFollow = useRef(false);
+  const aimAt = useRef(0);
+  const endDrag = useRef<() => void>(() => {});
+  const [armed, setArmed] = useState(false);
+  const slot = overlaySlot();
 
   function updateDraft(next: Rect | null) {
     draftRef.current = next;
@@ -39,16 +59,28 @@ export function Overlay() {
   useEffect(() => {
     let dead = false;
     let seen = -1;
-    let unlisten = () => {};
+    const stops: Array<() => void> = [];
     async function apply(frozen: FrozenCapture | null) {
       if (dead || !frozen) return;
       const generation = frozen.generation ?? 0;
       if (generation === seen) return;
       seen = generation;
-      const screen = screenOf(frozen);
+      const screen = screenOf(frozen, slot);
       drag.current = null;
       draftRef.current = null;
       setDraft(null);
+      setCursor(null);
+      if (!screen) {
+        ownsFollow.current = false;
+        setCapture(null);
+        setImage(null);
+        setSelection(null);
+        setArmed(false);
+        return;
+      }
+      const cursorScreen = isCursorScreen(frozen, screen);
+      ownsFollow.current = cursorScreen;
+      setArmed(cursorScreen);
       try {
         const loaded = await loadImage(screen.path || frozen.path);
         if (dead || seen !== generation) return;
@@ -61,18 +93,28 @@ export function Overlay() {
       }
       const preset = frozen.preset;
       let next: Rect | null = null;
-      if (preset) {
-        const cx = preset.x + preset.w / 2;
-        const cy = preset.y + preset.h / 2;
-        const inside = cx >= screen.x && cy >= screen.y && cx < screen.x + screen.width && cy < screen.y + screen.height;
-        if (inside) next = { x: Math.max(0, preset.x - screen.x), y: Math.max(0, preset.y - screen.y), w: preset.w, h: preset.h };
+      if (preset && cursorScreen) {
+        next = { x: Math.max(0, preset.x), y: Math.max(0, preset.y), w: preset.w, h: preset.h };
       }
       setCapture(frozen);
       setSelection(next);
     }
-    onEvent("overlay-show", () => { void currentCapture().then(apply); }).then((stop) => {
+    onEvent<{ armed?: boolean }>("overlay-show", (payload) => {
+      if (typeof payload?.armed === "boolean") setArmed(payload.armed);
+      void currentCapture().then(apply);
+    }).then((stop) => {
       if (dead) stop();
-      else unlisten = stop;
+      else stops.push(stop);
+    }).catch(() => undefined);
+    onEvent<boolean>("overlay-arm", (next) => {
+      setArmed(next);
+      if (!next) {
+        setCursor(null);
+        endDrag.current();
+      }
+    }).then((stop) => {
+      if (dead) stop();
+      else stops.push(stop);
     }).catch(() => undefined);
     currentCapture().then(apply).catch((reason: unknown) => {
       if (!dead) setError(reason instanceof Error ? reason.message : String(reason));
@@ -81,7 +123,7 @@ export function Overlay() {
     else ffmpegAvailable().then(setFfmpeg).catch(() => setFfmpeg(false));
     return () => {
       dead = true;
-      unlisten();
+      stops.forEach((stop) => stop());
       cancelAnimationFrame(raf.current);
       stopDragListen.current?.();
     };
@@ -90,7 +132,8 @@ export function Overlay() {
   const picking = selection == null;
   useEffect(() => {
     if (!capture) return;
-    void setOverlayFollow(picking);
+    if (ownsFollow.current) void setOverlayFollow(picking);
+    else if (!picking) void setOverlayFollow(false);
   }, [capture, picking]);
 
   useEffect(() => {
@@ -110,9 +153,12 @@ export function Overlay() {
 
   function windowsAt(x: number, y: number): WindowInfo[] {
     if (!capture) return [];
-    const screen = screenOf(capture);
-    return capture.windows
-      .map((item) => ({ ...item, x: item.x - screen.x, y: item.y - screen.y }))
+    const screen = screenOf(capture, slot);
+    if (!screen) return [];
+    const source = screen.windows != null
+      ? screen.windows
+      : capture.windows.map((item) => ({ ...item, x: item.x - screen.x, y: item.y - screen.y }));
+    return source
       .filter((item) => x >= item.x && y >= item.y && x <= item.x + item.width && y <= item.y + item.height)
       .sort((a, b) => a.z - b.z);
   }
@@ -147,10 +193,14 @@ export function Overlay() {
   }, [cursor, image]);
 
   if (!capture || !image) {
-    return <div className="overlay-root">{error && <p className="overlay-hint">{error}</p>}</div>;
+    return <div className={armed ? "overlay-root armed" : "overlay-root"}>{error && <p className="overlay-hint">{error}</p>}</div>;
   }
 
-  const screen = screenOf(capture);
+  const found = screenOf(capture, slot);
+  if (!found) {
+    return <div className="overlay-root" />;
+  }
+  const screen = found;
   const pointWindows = cursor ? windowsAt(cursor.x, cursor.y) : [];
   const active = pointWindows.length ? pointWindows[hover % pointWindows.length] : null;
   const live = draft ?? (active ? { x: active.x, y: active.y, w: active.width, h: active.height } : null);
@@ -209,10 +259,17 @@ export function Overlay() {
       const next = clampRect(region, { x: 0, y: 0, w: shot.naturalWidth, h: shot.naturalHeight });
       if (capture?.mode === "copy") void finishCopy(next);
       else setSelection(next);
-    } else updateDraft(null);
+    } else {
+      updateDraft(null);
+      // A click that does not finish a selection should keep following the pointer
+      // onto the other display. Follow is only for the screen that started the shot.
+      void setOverlayFollow(true);
+    }
   }
+  endDrag.current = commitDrag;
 
   function trackDrag(start: { x: number; y: number }) {
+    void setOverlayFollow(false);
     const bounds = { w: shot.naturalWidth, h: shot.naturalHeight };
     const onMove = (event: PointerEvent) => {
       const current = drag.current;
@@ -249,8 +306,36 @@ export function Overlay() {
     drag.current = { x: start.x, y: start.y, lx: start.x, ly: start.y, moved: false };
   }
 
+  function aimHere() {
+    setArmed(true);
+    const now = Date.now();
+    if (now - aimAt.current < 80) return;
+    aimAt.current = now;
+    void aimOverlay(screen.screenX, screen.screenY);
+  }
+
   return (
-    <div className="overlay-root">
+    <div
+      className={armed ? "overlay-root armed" : "overlay-root"}
+      onPointerEnter={() => {
+        if (drag.current || selection) return;
+        aimHere();
+      }}
+      onPointerLeave={(event) => {
+        // A synthesized mouseleave fires when focus hops to the other display,
+        // often while the pointer is still inside this one. Do not dim it here;
+        // the screen under the cursor is armed by aimOverlay / overlay-arm.
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const inside =
+          event.clientX >= bounds.left &&
+          event.clientX <= bounds.right &&
+          event.clientY >= bounds.top &&
+          event.clientY <= bounds.bottom;
+        if (inside) return;
+        setCursor(null);
+        commitDrag();
+      }}
+    >
       <img className="frozen-screen" src={image.src} alt="" draggable={false} />
       {selection ? (
         <Annotator
@@ -262,7 +347,21 @@ export function Overlay() {
           desktop
           ffmpeg={ffmpeg}
           onClose={() => { void cancelCapture(); }}
-          onScroll={() => void scrollCapture(screen.screenX + selection.x, screen.screenY + selection.y, selection.w, selection.h)}
+          onScroll={() => {
+            if (scrolling.current) return;
+            scrolling.current = true;
+            const x = Math.round(screen.screenX + selection.x);
+            const y = Math.round(screen.screenY + selection.y);
+            const w = Math.round(selection.w);
+            const h = Math.round(selection.h);
+            void scrollCapture(x, y, w, h)
+              .catch((reason: unknown) => {
+                setError(reason instanceof Error ? reason.message : String(reason));
+              })
+              .finally(() => {
+                scrolling.current = false;
+              });
+          }}
           onRecord={(choice) => {
             void startRecording(screen.screenX + selection.x, screen.screenY + selection.y, selection.w, selection.h, choice).catch((reason: unknown) => {
               setError(reason instanceof Error ? reason.message : String(reason));
@@ -272,9 +371,11 @@ export function Overlay() {
             let ocrText = "";
             if (action === "ocr") ocrText = await ocrPngBase64(png);
             const pinAt = action === "pin"
-              ? { x: screen.screenX + selection.x, y: screen.screenY + selection.y }
+              ? {
+                  x: Math.round(screen.screenX + selection.x),
+                  y: Math.round(screen.screenY + selection.y),
+                }
               : null;
-            if (pinAt) await cancelCapture();
             const item = await commitHistory({
               pngBase64: png,
               basePngBase64: base,
@@ -290,7 +391,7 @@ export function Overlay() {
               if (dest) await writePngBase64(png, dest);
             }
             if (pinAt) await pinPngBase64(png, pinAt.x, pinAt.y);
-            if (action !== "ocr" && !pinAt) await cancelCapture();
+            if (action !== "ocr") await cancelCapture();
             return ocrText;
           }}
         />
@@ -303,6 +404,7 @@ export function Overlay() {
           if (event.button !== 0) return;
           event.preventDefault();
           event.currentTarget.focus();
+          aimHere();
           const point = toImage(event);
           const start = {
             x: Math.min(shot.naturalWidth, Math.max(0, point.x)),
@@ -313,6 +415,7 @@ export function Overlay() {
         }}
         onPointerMove={(event) => {
           if (drag.current) return;
+          if (!armed) aimHere();
           const point = toImage(event);
           pendingPoint.current = point;
           if (raf.current) return;
@@ -351,7 +454,9 @@ export function Overlay() {
         )}
       </div>
       )}
-      {!selection && <p className="overlay-hint">{capture.mode === "copy" ? t("hintCopy") : t("hintPick")}</p>}
+      {error
+        ? <p className="overlay-hint">{error}</p>
+        : !selection && armed && <p className="overlay-hint">{capture.mode === "copy" ? t("hintCopy") : t("hintPick")}</p>}
     </div>
   );
 }
