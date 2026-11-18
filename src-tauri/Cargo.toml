@@ -1,0 +1,66 @@
+[package]
+name = "shotlet"
+version = "0.1.0"
+description = "Screenshot, annotate, pin, and record. A Tauri desktop app."
+authors = ["shotlet"]
+edition = "2024"
+
+[lib]
+name = "shotlet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-global-shortcut = "2.4.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xcap = { version = "0.9.10", features = ["image"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+arboard = "3.7.0"
+gif = "0.14.2"
+chrono = "0.4.45"
+base64 = "0.23.1"
+dirs = "7.0.0"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_Globalization",
+  "Foundation",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
+] }
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.xcap]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
