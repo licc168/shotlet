@@ -195,8 +195,8 @@ body:has(.pin) { background: transparent; overflow: hidden; }
 .split { width: 1px; height: 16px; margin: 0 3px; background: #e6e6e6; }
 .swatch { width: 16px; height: 16px; min-width: 16px; padding: 0; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18); }
 .text-draft, .text-draft:focus, .text-draft:focus-visible { position: absolute; z-index: 6; min-width: 8em; min-height: 1.25em; margin: 0; padding: 0; border: 0; border-radius: 0; outline: none; resize: none; overflow: hidden; background: transparent; box-shadow: none; font-family: "Segoe UI", sans-serif; line-height: 1.25; caret-color: currentColor; cursor: text; user-select: text; }
-.pin { width: 100%; height: 100%; display: grid; place-items: center; position: relative; }
-.pin img { max-width: 100%; max-height: 100%; transform-origin: center; cursor: grab; }
+.pin { width: 100%; height: 100%; display: grid; place-items: center; position: relative; overflow: hidden; }
+.pin img { width: 100%; height: 100%; object-fit: fill; cursor: grab; display: block; }
 .pin p, .pin-menu { position: absolute; left: 8px; bottom: 8px; margin: 0; color: white; background: rgba(16, 16, 16, 0.72); border-radius: 8px; padding: 4px 8px; font-size: 12px; }
 .pin p { opacity: 0; transition: opacity 0.15s ease; }
 .pin:hover p { opacity: 1; }
