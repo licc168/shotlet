@@ -914,7 +914,12 @@ function ToolIcon({ name }: { name: string }) {
       {name === "scroll" && <path {...stroke} d="M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4" />}
       {name === "record" && <circle cx="12" cy="12" r="5" fill="#e23b32" />}
       {name === "rotate" && <path {...stroke} d="M19 12a7 7 0 1 1-2-4.9M19 4v4h-4" />}
-      {name === "pin" && <path {...stroke} d="M9 4.5h6l-1 6.2 2.2 2.3H7.8L10 10.7zM12 13v6.5" />}
+      {name === "pin" && (
+        <>
+          <path {...stroke} d="M12 17v5" />
+          <path {...stroke} d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+        </>
+      )}
       {name === "save" && <path {...stroke} d="M12 4v10M8 10l4 4 4-4M5 19h14" />}
       {name === "close" && <path {...stroke} d="M7 7l10 10M17 7 7 17" />}
       {name === "check" && <path d="M6 12.5 10 16.5 18 7.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />}
