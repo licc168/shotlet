@@ -461,14 +461,12 @@ pub async fn pin_capture_region(
     // `x`/`y` address the packed crop. The desktop cut is derived here, not on the page.
     let (place_x, place_y, place_w, place_h) = capture_session::desktop_rect(screen_x, screen_y, local_x, local_y, width, height, bitmap_w, bitmap_h, point_w, point_h);
     let taken = library::taken_capture(&app.state::<AppState>())?;
+    let image = tauri::async_runtime::spawn_blocking(move || library::crop_pin_image(taken, x, y, width, height))
+        .await
+        .map_err(err)??;
+    library::trace("pin: plain cropped");
     let root = storage(&app)?;
-    let (path, _pinned_w, _pinned_h) = tauri::async_runtime::spawn_blocking(move || {
-        library::pin_taken(&root, taken, x, y, width, height)
-    })
-    .await
-    .map_err(err)??;
-    library::trace("pin: plain file written");
-    ui::open_pin(&app, path.to_string_lossy().to_string(), place_x, place_y, place_w, place_h)?
+    ui::open_memory(&app, root, image, place_x, place_y, place_w, place_h)?
         .ready()
         .await?;
     Ok(())
@@ -505,15 +503,24 @@ pub async fn pin_annotated(
         point_h.round().max(0.0) as u32,
     );
     let root = storage(&app)?;
-    let (path, _width, _height) = tauri::async_runtime::spawn_blocking(move || {
+    let (path, pixels_w, pixels_h) = tauri::async_runtime::spawn_blocking(move || {
         library::pin_annotated(&root, &png, &base, &document)
     })
     .await
     .map_err(err)??;
     library::trace("pin: annotated file written");
-    ui::open_pin(&app, path.to_string_lossy().to_string(), place_x, place_y, place_w, place_h)?
-        .ready()
-        .await?;
+    ui::open_file(
+        &app,
+        path.to_string_lossy().to_string(),
+        place_x,
+        place_y,
+        place_w,
+        place_h,
+        pixels_w,
+        pixels_h,
+    )?
+    .ready()
+    .await?;
     Ok(())
 }
 
@@ -525,12 +532,29 @@ pub fn copy_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u
 }
 
 pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
-    let (path, x, y, width, height) = tauri::async_runtime::spawn_blocking(library::pin_clipboard).await.map_err(err)??;
-    eprintln!("pin: clipboard {} at {x},{y} ({width}x{height})", path.display());
-    ui::open_pin(app, path.to_string_lossy().to_string(), x, y, width, height)?
-        .ready()
-        .await?;
+    let (image, x, y) = tauri::async_runtime::spawn_blocking(library::pin_clipboard).await.map_err(err)??;
+    let width = image.width();
+    let height = image.height();
+    eprintln!("pin: clipboard memory at {x},{y} ({width}x{height})");
+    let root = storage(app)?;
+    ui::open_memory(app, root, image, x, y, width, height)?.ready().await?;
     let _ = app.emit("capture-error", "已贴图");
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn pin_pixels(state: State<AppState>, id: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = library::pin_rgba(&state, &id)?;
+    if bytes.len() > 96 * 1024 * 1024 {
+        return Err("截图太大，无法显示".into());
+    }
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub fn copy_pin(app: AppHandle, id: String) -> Result<(), String> {
+    library::copy_pin(&app.state::<AppState>(), &id)?;
+    let _ = app.emit("capture-error", "已复制截图");
     Ok(())
 }
 

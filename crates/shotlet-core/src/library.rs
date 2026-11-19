@@ -230,14 +230,54 @@ pub fn pin_annotated(root: &Path, png_b64: &str, base_b64: &str, document: &str)
     Ok((path, width, height))
 }
 
-pub fn pin_clipboard() -> Result<(PathBuf, i32, i32, u32, u32), String> {
+pub fn pin_clipboard() -> Result<(crate::pin_session::PinImage, i32, i32), String> {
     let image = util::clipboard_rgba()?;
+    let (x, y) = capture::cursor_point().unwrap_or((120, 120));
+    Ok((std::sync::Arc::new(image), x, y))
+}
+
+/// Crop the frozen selection and keep the pixels. The file is written later.
+pub fn crop_pin_image(taken: (Vec<capture::ScreenImage>, String), x: i32, y: i32, width: u32, height: u32) -> Result<crate::pin_session::PinImage, String> {
+    let (screens, path) = taken;
+    let cropped = if screens.is_empty() {
+        let image = util::read_png_file(Path::new(&path))?;
+        capture::crop_frozen(&image, x, y, width, height)?
+    } else {
+        capture::crop_screens(&screens, x, y, width, height)?
+    };
+    Ok(std::sync::Arc::new(cropped))
+}
+
+/// Encode once. The same bytes go to the pin file and to history.
+pub fn store_pin(root: &Path, image: &image::RgbaImage) -> Result<PathBuf, String> {
+    let png = util::encode_png_fast(image)?;
     let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
+    util::write_bytes(&path, &png)?;
+    let root = root.to_path_buf();
     let width = image.width();
     let height = image.height();
-    util::write_png(&path, &image)?;
-    let (x, y) = capture::cursor_point().unwrap_or((120, 120));
-    Ok((path, x, y, width, height))
+    std::thread::spawn(move || {
+        if let Err(error) = history::commit_bytes(&root, &png, &png, "[]", width, height, "", "") {
+            eprintln!("history: {error}");
+        }
+    });
+    Ok(path)
+}
+
+pub fn pin_rgba(state: &AppState, id: &str) -> Result<Vec<u8>, String> {
+    if let Some(image) = crate::pin_session::image_of(state, id) {
+        return Ok(image.as_raw().to_vec());
+    }
+    let path = crate::pin_session::file_path(state, id)?;
+    let image = util::read_png_file(Path::new(&path))?;
+    Ok(image.into_raw())
+}
+
+pub fn copy_pin(state: &AppState, id: &str) -> Result<(), String> {
+    if let Some(image) = crate::pin_session::image_of(state, id) {
+        return util::copy_rgba(&image);
+    }
+    copy_png_file(Path::new(&crate::pin_session::file_path(state, id)?))
 }
 
 pub fn pin_path(state: &AppState, id: &str) -> Result<String, String> {

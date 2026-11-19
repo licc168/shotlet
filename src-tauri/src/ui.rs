@@ -750,7 +750,7 @@ pub fn open_editor(app: &AppHandle) -> Result<(), String> {
 const PIN_GLOW: i32 = 22;
 /// Safety reveal if the page never reports that the picture is painted.
 const PIN_REVEAL_FALLBACK: Duration = Duration::from_secs(8);
-const PIN_REVEAL_WAIT: Duration = Duration::from_secs(12);
+const PIN_REVEAL_WAIT: Duration = Duration::from_secs(3);
 
 fn pin_signals() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>> {
     static SIGNALS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>>> = OnceLock::new();
@@ -772,13 +772,20 @@ fn signal_pin(label: &str, result: Result<(), String>) {
 #[must_use]
 pub struct PinWait {
     rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    app: AppHandle,
+    label: String,
 }
 
 impl PinWait {
     pub fn wait(self) -> Result<(), String> {
         match self.rx.recv_timeout(PIN_REVEAL_WAIT) {
             Ok(result) => result,
-            Err(_) => Err("贴图没有出现".into()),
+            Err(_) => {
+                let app = self.app.clone();
+                let label = self.label;
+                let _ = on_main(&app, move |app| reveal_pin(app, &label));
+                Ok(())
+            }
         }
     }
 
@@ -862,7 +869,16 @@ pub fn zoom_pin(window: &WebviewWindow, scale: f64) {
     place_pin_window(window.app_handle(), window, &label, frame);
 }
 
-fn remember_pin(app: &AppHandle, label: &str, path: &str, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+fn remember_pin(
+    app: &AppHandle,
+    label: &str,
+    image: Option<pin_session::PinImage>,
+    path: Option<PathBuf>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let group = *state.pin_group.lock().map_err(err)?;
     if let Ok(mut hidden) = state.pins_hidden.lock() {
@@ -872,11 +888,31 @@ fn remember_pin(app: &AppHandle, label: &str, path: &str, x: i32, y: i32, width:
         state.inner(),
         label,
         group,
-        None,
-        Some(PathBuf::from(path)),
+        image,
+        path,
         PinCut { x, y, width: width.max(1), height: height.max(1) },
     );
     Ok(())
+}
+
+fn publish_pin(app: &AppHandle, label: &str, root: PathBuf, image: pin_session::PinImage) {
+    let app = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        let path = match shotlet_core::library::store_pin(&root, &image) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("pin: store failed: {error}");
+                return;
+            }
+        };
+        let app = app.clone();
+        let _ = app.clone().run_on_main_thread(move || {
+            let state = app.state::<AppState>();
+            pin_session::set_file(state.inner(), &label, path);
+            pin_session::release_image(state.inner(), &label);
+        });
+    });
 }
 
 fn arm_pin_wait(app: &AppHandle, label: &str) -> PinWait {
@@ -888,7 +924,7 @@ fn arm_pin_wait(app: &AppHandle, label: &str) -> PinWait {
         std::thread::sleep(PIN_REVEAL_FALLBACK);
         let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
     });
-    PinWait { rx }
+    PinWait { rx, app: app.clone(), label: label.to_string() }
 }
 
 fn take_spare(app: &AppHandle) -> Option<String> {
@@ -904,6 +940,53 @@ fn take_spare(app: &AppHandle) -> Option<String> {
 pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<PinWait, String> {
     let width = width.max(1);
     let height = height.max(1);
+    open_file(app, path, x, y, width, height, width, height)
+}
+
+/// A file pin whose bitmap is not the same size as the desktop window.
+pub fn open_file(
+    app: &AppHandle,
+    path: String,
+    x: i32,
+    y: i32,
+    window_w: u32,
+    window_h: u32,
+    pixels_w: u32,
+    pixels_h: u32,
+) -> Result<PinWait, String> {
+    open_picture(app, None, Some(PathBuf::from(path)), None, x, y, window_w, window_h, pixels_w, pixels_h)
+}
+
+pub fn open_memory(
+    app: &AppHandle,
+    root: PathBuf,
+    image: pin_session::PinImage,
+    x: i32,
+    y: i32,
+    window_w: u32,
+    window_h: u32,
+) -> Result<PinWait, String> {
+    let pixels_w = image.width();
+    let pixels_h = image.height();
+    open_picture(app, Some(image), None, Some(root), x, y, window_w, window_h, pixels_w, pixels_h)
+}
+
+fn open_picture(
+    app: &AppHandle,
+    image: Option<pin_session::PinImage>,
+    path: Option<PathBuf>,
+    root: Option<PathBuf>,
+    x: i32,
+    y: i32,
+    window_w: u32,
+    window_h: u32,
+    pixels_w: u32,
+    pixels_h: u32,
+) -> Result<PinWait, String> {
+    let window_w = window_w.max(1);
+    let window_h = window_h.max(1);
+    let pixels_w = pixels_w.max(1);
+    let pixels_h = pixels_h.max(1);
     let reused = take_spare(app);
     // A warmed window already has its label. The picture id has to be that label,
     // or hiding and switching groups cannot find the window.
@@ -912,22 +995,35 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
         None => new_id(),
     };
     let label = reused.clone().unwrap_or_else(|| format!("pin-{id}"));
-    remember_pin(app, &label, &path, x, y, width, height)?;
+    remember_pin(app, &label, image.clone(), path, x, y, window_w, window_h)?;
+    if let (Some(image), Some(root)) = (image, root) {
+        publish_pin(app, &label, root, image);
+    }
     let wait = arm_pin_wait(app, &label);
     if reused.is_some() {
-        hand_pin(app, label, id, path, x, y, width, height)?;
+        hand_pin(app, label, id, x, y, window_w, window_h, pixels_w, pixels_h)?;
     } else {
-        open_fresh_pin(app, label, id, x, y, width, height)?;
+        open_fresh_pin(app, label, id, x, y, window_w, window_h, pixels_w, pixels_h)?;
     }
     replenish_pin(app);
     Ok(wait)
 }
 
-fn hand_pin(app: &AppHandle, label: String, id: String, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+fn hand_pin(
+    app: &AppHandle,
+    label: String,
+    id: String,
+    x: i32,
+    y: i32,
+    window_w: u32,
+    window_h: u32,
+    pixels_w: u32,
+    pixels_h: u32,
+) -> Result<(), String> {
     crate::util::trace("pin: reuse standby");
-    eprintln!("pin: reuse {label} as {id} at {x},{y} size {width}x{height}");
-    let frame = pin_frame(x, y, width, height);
-    let payload = PinAssign { id, path, x, y, width, height };
+    eprintln!("pin: reuse {label} as {id} at {x},{y} size {window_w}x{window_h}");
+    let frame = pin_frame(x, y, window_w, window_h);
+    let payload = PinAssign { id, width: pixels_w, height: pixels_h };
     on_main(app, move |app| {
         if let Some(window) = app.get_webview_window(&label) {
             place_pin_window(app, &window, &label, frame);
@@ -936,11 +1032,21 @@ fn hand_pin(app: &AppHandle, label: String, id: String, path: String, x: i32, y:
     })
 }
 
-fn open_fresh_pin(app: &AppHandle, label: String, id: String, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
-    let frame = pin_frame(x, y, width, height);
-    let query = format!("view=pin&id={id}");
+fn open_fresh_pin(
+    app: &AppHandle,
+    label: String,
+    id: String,
+    x: i32,
+    y: i32,
+    window_w: u32,
+    window_h: u32,
+    pixels_w: u32,
+    pixels_h: u32,
+) -> Result<(), String> {
+    let frame = pin_frame(x, y, window_w, window_h);
+    let query = format!("view=pin&id={id}&w={pixels_w}&h={pixels_h}");
     crate::util::trace("pin: window begin");
-    eprintln!("pin: open {label} at {x},{y} size {width}x{height} frame {},{} {}x{}", frame.x, frame.y, frame.width, frame.height);
+    eprintln!("pin: open {label} at {x},{y} size {window_w}x{window_h} frame {},{} {}x{}", frame.x, frame.y, frame.width, frame.height);
     on_main(app, move |app| {
         let window = WebviewWindowBuilder::new(app, &label, view_url(&query))
             .title("Shotlet Pin")
@@ -1013,9 +1119,6 @@ pub fn replenish_pin(app: &AppHandle) {
 #[serde(rename_all = "camelCase")]
 struct PinAssign {
     id: String,
-    path: String,
-    x: i32,
-    y: i32,
     width: u32,
     height: u32,
 }

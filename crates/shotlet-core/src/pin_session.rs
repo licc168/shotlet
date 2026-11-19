@@ -6,6 +6,8 @@ use std::sync::{Arc, MutexGuard};
 
 use image::RgbaImage;
 
+pub type PinImage = Arc<RgbaImage>;
+
 use crate::state::AppState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -58,6 +58,8 @@ pub fn run() {
             commands::pin_capture_region,
             commands::pin_annotated,
             commands::pin_path,
+            commands::pin_pixels,
+            commands::copy_pin,
             commands::pin_ready,
             commands::pin_standby,
             commands::pin_zoom,

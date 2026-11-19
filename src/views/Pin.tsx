@@ -1,6 +1,6 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { copyFile, isTauri, loadImage, onEvent, pinPath, pinReady, pinStandby, pinZoom, tracePage } from "../api";
+import { copyPin, fetchPixels, isTauri, loadImage, onEvent, paintPixels, pinPath, pinReady, pinStandby, pinZoom, tracePage } from "../api";
 import { useI18n } from "../i18n";
 import {
   PIN_MAX_OPACITY,
@@ -12,17 +12,20 @@ import {
   type ClickStamp,
 } from "../lib/pin";
 
+type PinAssign = { id: string; width: number; height: number };
+
 export function Pin() {
   const { t } = useI18n();
   const tRef = useRef(t);
   tRef.current = t;
-  const [src, setSrc] = useState("");
-  const [file, setFile] = useState("");
   const [failed, setFailed] = useState("");
+  const [painted, setPainted] = useState(false);
   const [opacity, setOpacity] = useState(1);
   const [menu, setMenu] = useState(false);
   const [glow, setGlow] = useState(() => pinGlowCssPx(window.devicePixelRatio));
   const pinRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const idRef = useRef("");
   const lastClickRef = useRef<ClickStamp | null>(null);
   const revealedRef = useRef(false);
   const scaleRef = useRef(1);
@@ -36,37 +39,54 @@ export function Pin() {
   useEffect(() => {
     let cancel = false;
     const params = new URLSearchParams(location.search);
-    const id = params.get("id") ?? "";
-    async function show(path: string) {
-      if (cancel) return;
-      if (!path) {
-        setFailed(tRef.current("empty"));
-        return;
-      }
+    const initialId = params.get("id") ?? "";
+    const initialW = Number(params.get("w") || 0);
+    const initialH = Number(params.get("h") || 0);
+    async function show(id: string, width: number, height: number) {
+      const canvas = canvasRef.current;
+      if (cancel || !canvas || !id) return;
+      idRef.current = id;
       setFailed("");
-      setFile(path);
-      if (path.startsWith("data:") || path.startsWith("blob:") || path.startsWith("http")) {
-        setSrc(path);
-        return;
+      try {
+        if (!isTauri()) {
+          const path = await pinPath(id);
+          if (cancel) return;
+          if (!path) {
+            setFailed(tRef.current("empty"));
+            return;
+          }
+          const image = await loadImage(path);
+          if (cancel) return;
+          canvas.width = image.naturalWidth;
+          canvas.height = image.naturalHeight;
+          canvas.getContext("2d")?.drawImage(image, 0, 0);
+          setPainted(true);
+          return;
+        }
+        const pixels = await fetchPixels("pin_pixels", { id }, width, height, "pin");
+        if (cancel) return;
+        if (!pixels || !paintPixels(canvas, pixels, width, height, false)) {
+          setFailed(tRef.current("empty"));
+          return;
+        }
+        tracePage("pin: pixels painted");
+        setPainted(true);
+        void revealPin(revealedRef);
+      } catch (reason: unknown) {
+        if (!cancel) setFailed(reason instanceof Error ? reason.message : String(reason));
       }
-      // asset:// taints or fails to paint inside a transparent pin window.
-      const image = await loadImage(path);
-      tracePage("pin: pixels arrived");
-      if (!cancel) setSrc(image.src);
     }
     let stop: () => void = () => undefined;
-    if (id) {
-      pinPath(id).then(show).catch((reason: unknown) => {
-        if (!cancel) setFailed(reason instanceof Error ? reason.message : String(reason));
-      });
+    if (initialId && (initialW > 0 && initialH > 0 || !isTauri())) {
+      void show(initialId, initialW, initialH);
     } else if (isTauri()) {
-      // A warmed window has no picture yet. Report once, then wait for the picture.
       void pinStandby();
-      onEvent<{ path: string }>("pin-assign", (payload) => {
-        if (cancel || !payload?.path) return;
+      onEvent<PinAssign>("pin-assign", (payload) => {
+        if (cancel || !payload?.id || !(payload.width > 0) || !(payload.height > 0)) return;
         tracePage("pin: assign received");
         revealedRef.current = false;
-        void show(payload.path);
+        scaleRef.current = 1;
+        void show(payload.id, payload.width, payload.height);
       }).then((unlisten) => {
         if (cancel) unlisten();
         else stop = unlisten;
@@ -82,6 +102,7 @@ export function Pin() {
     const node = pinRef.current;
     if (!node) return;
     const onWheel = (event: WheelEvent) => {
+      if (!painted) return;
       event.preventDefault();
       if (event.ctrlKey || event.metaKey) {
         setOpacity((value) => Math.min(PIN_MAX_OPACITY, Math.max(PIN_MIN_OPACITY, value + (event.deltaY < 0 ? PIN_OPACITY_STEP : -PIN_OPACITY_STEP))));
@@ -92,14 +113,14 @@ export function Pin() {
     };
     node.addEventListener("wheel", onWheel, { passive: false });
     return () => node.removeEventListener("wheel", onWheel);
-  }, [src]);
+  }, [painted]);
 
   useEffect(() => {
     if (failed) void revealPin(revealedRef);
   }, [failed]);
 
   function onPointerDown(event: React.PointerEvent) {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || !painted) return;
     if ((event.target as HTMLElement).closest("button, .pin-menu")) return;
     const stamp = { time: Date.now(), x: event.clientX, y: event.clientY };
     if (event.detail >= 2 || isDoubleClick(lastClickRef.current, stamp)) {
@@ -116,30 +137,20 @@ export function Pin() {
     void getCurrentWindow().startDragging();
   }
 
-  if (!src) return <main className={failed ? "pin empty failed" : "pin empty"}>{failed}</main>;
-
   return (
     <div
       ref={pinRef}
-      className="pin"
+      className={failed ? "pin empty failed" : "pin"}
       style={{ opacity, "--pin-glow": `${glow}px` } as CSSProperties}
       onPointerDown={onPointerDown}
-      onDoubleClick={() => void closePin()}
-      onContextMenu={(event) => { event.preventDefault(); setMenu(true); }}
+      onDoubleClick={() => { if (painted) void closePin(); }}
+      onContextMenu={(event) => { event.preventDefault(); if (painted) setMenu(true); }}
     >
-      <div className="pin-glow" aria-hidden="true" />
-      <img
-        src={src}
-        alt=""
-        draggable={false}
-        onLoad={() => void revealPin(revealedRef)}
-        ref={(image) => {
-          if (image?.complete && image.naturalWidth) void revealPin(revealedRef);
-        }}
-      />
+      {failed ? failed : <div className="pin-glow" aria-hidden="true" />}
+      <canvas ref={canvasRef} />
       {menu && (
         <div className="pin-menu">
-          <button onClick={() => void copyFile(file || src)}>{t("copy")}</button>
+          <button onClick={() => void copyPin(idRef.current)}>{t("copy")}</button>
           <button onClick={() => void closePin()}>{t("cancel")}</button>
         </div>
       )}

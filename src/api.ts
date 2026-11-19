@@ -336,6 +336,16 @@ export async function pinPath(id: string): Promise<string> {
   return call<string>("pin_path", { id });
 }
 
+/** Copy the sticker from memory while the pixels are still there, otherwise from its file. */
+export async function copyPin(id: string): Promise<void> {
+  if (!isTauri()) {
+    const path = await pinPath(id);
+    if (path) await copyFile(path);
+    return;
+  }
+  await call("copy_pin", { id });
+}
+
 /** A warmed pin window has loaded and is waiting for a picture. */
 export async function pinStandby(): Promise<void> {
   if (!isTauri()) return;
@@ -525,23 +535,48 @@ export async function pickDirectory(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
-export async function loadFrozen(path: string, width: number, height: number): Promise<ShotImage> {
-  if (!isTauri() || !(width > 0) || !(height > 0)) return loadImage(path);
-  tracePage("f1: pixels requested");
-  const bytes = await call<ArrayBuffer | Uint8Array>("preview_rgba", { path });
-  tracePage("f1: pixels received");
+/** Raw RGBA from a command. `null` means the byte length does not match the size. */
+export async function fetchPixels(
+  command: string,
+  args: Record<string, unknown>,
+  width: number,
+  height: number,
+  stage: string,
+): Promise<Uint8ClampedArray<ArrayBuffer> | null> {
+  if (!(width > 0) || !(height > 0)) return null;
+  tracePage(`${stage}: pixels requested`);
+  const bytes = await call<ArrayBuffer | Uint8Array>(command, args);
+  tracePage(`${stage}: pixels received`);
   const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  if (raw.byteLength !== width * height * 4) return loadImage(path);
-  const canvas = document.createElement("canvas");
+  if (raw.byteLength !== width * height * 4) return null;
+  return imagePixels(raw);
+}
+
+function imagePixels(raw: Uint8Array): Uint8ClampedArray<ArrayBuffer> {
+  // Share the command's buffer instead of copying the whole screen again.
+  if (raw.buffer instanceof ArrayBuffer) {
+    return new Uint8ClampedArray(raw.buffer, raw.byteOffset, raw.byteLength);
+  }
+  const copy = new Uint8ClampedArray(raw.byteLength);
+  copy.set(raw);
+  return copy;
+}
+
+export function paintPixels(canvas: HTMLCanvasElement, pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, opaque = true): boolean {
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext("2d", { alpha: false });
-  if (!ctx) return loadImage(path);
-  // Share the command's buffer instead of copying the whole screen again.
-  const pixels = raw.buffer instanceof ArrayBuffer
-    ? new Uint8ClampedArray(raw.buffer, raw.byteOffset, raw.byteLength)
-    : new Uint8ClampedArray(raw);
+  const ctx = canvas.getContext("2d", { alpha: !opaque });
+  if (!ctx) return false;
   ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+  return true;
+}
+
+export async function loadFrozen(path: string, width: number, height: number): Promise<ShotImage> {
+  if (!isTauri() || !(width > 0) || !(height > 0)) return loadImage(path);
+  const pixels = await fetchPixels("preview_rgba", { path }, width, height, "f1");
+  if (!pixels) return loadImage(path);
+  const canvas = document.createElement("canvas");
+  if (!paintPixels(canvas, pixels, width, height)) return loadImage(path);
   tracePage("f1: pixels painted");
   const shot = canvas as HTMLCanvasElement & ShotImage;
   shot.naturalWidth = width;
