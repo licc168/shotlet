@@ -118,6 +118,11 @@ pub fn revealed_rows(prev: &RgbaImage, next: &RgbaImage, expected: Option<u32>) 
     choose_shift(&down_candidates(prev, next), expected).map(|score| score.shift)
 }
 
+/// How many new rows appeared at the top of `next` after an upward scroll.
+pub fn revealed_top_rows(prev: &RgbaImage, next: &RgbaImage) -> Option<u32> {
+    choose_shift(&up_candidates(prev, next), None).map(|score| score.shift)
+}
+
 pub fn scroll_motion(prev: &RgbaImage, next: &RgbaImage) -> ScrollMotion {
     let down_scores = down_candidates(prev, next);
     let up_scores = up_candidates(prev, next);
@@ -131,6 +136,25 @@ pub fn scroll_motion(prev: &RgbaImage, next: &RgbaImage) -> ScrollMotion {
         (None, Some(_)) => ScrollMotion::Up,
         (None, None) => ScrollMotion::Still,
     }
+}
+
+/// Put `rows` above `base`. Widths must match; an empty strip leaves `base` unchanged.
+pub fn prepend_rows(base: &RgbaImage, rows: &RgbaImage) -> RgbaImage {
+    if rows.height() == 0 || rows.width() != base.width() {
+        return base.clone();
+    }
+    let mut out = RgbaImage::new(base.width(), rows.height().saturating_add(base.height()));
+    for y in 0..rows.height() {
+        for x in 0..rows.width() {
+            out.put_pixel(x, y, *rows.get_pixel(x, y));
+        }
+    }
+    for y in 0..base.height() {
+        for x in 0..base.width() {
+            out.put_pixel(x, rows.height() + y, *base.get_pixel(x, y));
+        }
+    }
+    out
 }
 
 /// Append `rows` under `base`. Widths must match; an empty strip leaves `base` unchanged.
@@ -318,6 +342,12 @@ mod tests {
         let next = image::imageops::crop_imm(&full, 0, 0, 30, 40).to_image();
         assert_eq!(scroll_motion(&prev, &next), ScrollMotion::Up);
         assert!(revealed_rows(&prev, &next, Some(15)).is_none());
+        assert_eq!(revealed_top_rows(&prev, &next), Some(15));
+        let top = image::imageops::crop_imm(&next, 0, 0, 30, 15).to_image();
+        let stitched = prepend_rows(&prev, &top);
+        assert_eq!(stitched.height(), 55);
+        assert_eq!(stitched.get_pixel(4, 0), full.get_pixel(4, 0));
+        assert_eq!(stitched.get_pixel(4, 54), full.get_pixel(4, 54));
     }
 
     #[test]

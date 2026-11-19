@@ -5,6 +5,7 @@ import { Home } from "./views/Home";
 import { Overlay } from "./views/Overlay";
 import { Pin } from "./views/Pin";
 import { Recorder } from "./views/Recorder";
+import { ScrollChrome } from "./views/ScrollChrome";
 import { SettingsView } from "./views/Settings";
 import "./styles.css";
 
@@ -25,6 +26,7 @@ export default function App() {
       {view === "editor" && <Editor />}
       {view === "pin" && <Pin />}
       {view === "recorder" && <Recorder />}
+      {view === "scroll" && <ScrollChrome />}
       {view === "home" && <Home />}
     </I18nProvider>
   );

@@ -41,6 +41,14 @@ pub fn on_main_wait<T: Send + 'static>(
     app: &AppHandle,
     task: impl FnOnce(&AppHandle) -> T + Send + 'static,
 ) -> Result<T, String> {
+    on_main_wait_for(app, Duration::from_secs(2), task)
+}
+
+pub fn on_main_wait_for<T: Send + 'static>(
+    app: &AppHandle,
+    timeout: Duration,
+    task: impl FnOnce(&AppHandle) -> T + Send + 'static,
+) -> Result<T, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let app = app.clone();
     app.clone()
@@ -48,8 +56,7 @@ pub fn on_main_wait<T: Send + 'static>(
             let _ = tx.send(task(&app));
         })
         .map_err(err)?;
-    rx.recv_timeout(Duration::from_secs(2))
-        .map_err(|_| "界面线程没有响应".to_string())
+    rx.recv_timeout(timeout).map_err(|_| "界面线程没有响应".to_string())
 }
 
 pub fn open_history(app: &AppHandle) {
@@ -321,14 +328,22 @@ pub fn aim_overlay_at(app: &AppHandle, x: i32, y: i32) {
     };
     let generation = state.overlay_generation.load(Ordering::Relaxed);
     drop(state);
-    let rects = rects_of(&screens);
-    let Some(monitor) = capture::monitor_at_point(&rects, x, y) else {
+    let index = if let Some(index) = screens.iter().position(|screen| screen.screen_x == x && screen.screen_y == y) {
+        index
+    } else {
+        let rects = rects_of(&screens);
+        let Some(monitor) = capture::monitor_at_point(&rects, x, y) else {
+            return;
+        };
+        let Some(index) = screens.iter().position(|screen| screen.screen_x == monitor.x && screen.screen_y == monitor.y) else {
+            return;
+        };
+        index
+    };
+    let Some(screen) = screens.get(index) else {
         return;
     };
-    let key = (monitor.x, monitor.y);
-    let Some(index) = screens.iter().position(|screen| screen.screen_x == key.0 && screen.screen_y == key.1) else {
-        return;
-    };
+    let key = (screen.screen_x, screen.screen_y);
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         let state = app.state::<AppState>();
@@ -337,9 +352,6 @@ pub fn aim_overlay_at(app: &AppHandle, x: i32, y: i32) {
         }
         let aimed = state.overlay_aim.lock().ok().and_then(|slot| *slot);
         if aimed == Some(key) {
-            drop(state);
-            // Pointer enter can race a synthesized mouseleave that already dimmed this screen.
-            emit_overlay_arm(&app, &screens, key);
             return;
         }
         if let Ok(mut aim) = state.overlay_aim.lock() {
@@ -401,8 +413,12 @@ fn place_mac_overlay(window: &WebviewWindow, place: &OverlayPlace, focus: bool) 
 
 #[cfg(not(target_os = "macos"))]
 fn move_overlay_window(window: &WebviewWindow, place: &OverlayPlace) -> Result<(), String> {
+    // The bitmap can be larger than the monitor slot. Sizing the window to the bitmap
+    // lets the left screen cover the right one, so the right overlay never receives the pointer.
+    let width = if place.point_width == 0 { place.width } else { place.point_width };
+    let height = if place.point_height == 0 { place.height } else { place.point_height };
     window.set_position(PhysicalPosition::new(place.x, place.y)).map_err(err)?;
-    window.set_size(PhysicalSize::new(place.width, place.height)).map_err(err)?;
+    window.set_size(PhysicalSize::new(width, height)).map_err(err)?;
     Ok(())
 }
 
@@ -438,14 +454,12 @@ fn follow_loop(app: AppHandle) {
     static FOCUSING: AtomicBool = AtomicBool::new(false);
     let mut stable: Option<(i32, i32)> = None;
     let mut stable_hits = 0u8;
-    let mut pulse = 0u8;
     loop {
         std::thread::sleep(Duration::from_millis(40));
         let state = app.state::<AppState>();
         if !state.overlay_follow.load(Ordering::Relaxed) {
             stable = None;
             stable_hits = 0;
-            pulse = 0;
             continue;
         }
         let screens = match state.capture.lock() {
@@ -464,17 +478,12 @@ fn follow_loop(app: AppHandle) {
         } else {
             stable = Some(key);
             stable_hits = 1;
-            pulse = 0;
         }
         if stable_hits < 2 {
             continue;
         }
         let aimed = state.overlay_aim.lock().ok().and_then(|slot| *slot);
-        let changed = aimed != Some(key);
-        pulse = pulse.wrapping_add(1);
-        // A synthesized mouseleave can dim the screen after it was armed. Re-apply
-        // the highlight while the pointer stays, but don't steal focus again.
-        if !changed && pulse % 8 != 0 {
+        if aimed == Some(key) {
             continue;
         }
         let generation = state.overlay_generation.load(Ordering::Relaxed);
@@ -482,44 +491,40 @@ fn follow_loop(app: AppHandle) {
         let Some(index) = screens.iter().position(|screen| screen.screen_x == key.0 && screen.screen_y == key.1) else {
             continue;
         };
-        if changed && FOCUSING.swap(true, Ordering::SeqCst) {
+        if FOCUSING.swap(true, Ordering::SeqCst) {
             continue;
         }
         let app_for_window = app.clone();
         let screens_for_arm = screens;
         let queued = app_for_window.clone().run_on_main_thread(move || {
-            let release = || {
-                if changed {
-                    FOCUSING.store(false, Ordering::SeqCst);
-                }
-            };
+            let release = || FOCUSING.store(false, Ordering::SeqCst);
             let state = app_for_window.state::<AppState>();
             if !state.overlay_follow.load(Ordering::Relaxed) || state.overlay_generation.load(Ordering::Relaxed) != generation {
                 release();
                 return;
             }
-            let cursor_window = app_for_window.get_webview_window(&overlay_label(index));
-            let cursor_hidden = cursor_window.as_ref().is_some_and(|window| !window.is_visible().unwrap_or(false));
-            if changed {
-                if cursor_window.is_none() {
-                    release();
-                    return;
-                }
-                if let Ok(mut aim) = state.overlay_aim.lock() {
-                    *aim = Some(key);
-                }
+            if app_for_window.get_webview_window(&overlay_label(index)).is_none() {
+                release();
+                return;
+            }
+            let already = state.overlay_aim.lock().ok().and_then(|slot| *slot);
+            if already == Some(key) {
+                drop(state);
+                release();
+                return;
+            }
+            if let Ok(mut aim) = state.overlay_aim.lock() {
+                *aim = Some(key);
             }
             drop(state);
-            // Hidden overlays still belong on their own displays. Show those first,
-            // then key the one under the pointer so it stays the front window.
+            // Show the other displays first, then key the one under the pointer.
+            // Repeating this while the pointer stays steals focus and flashes the freeze.
             raise_hidden_overlays(&app_for_window, &screens_for_arm, index);
-            if changed || cursor_hidden {
-                focus_overlay(&app_for_window, &screens_for_arm, index);
-            }
+            focus_overlay(&app_for_window, &screens_for_arm, index);
             emit_overlay_arm(&app_for_window, &screens_for_arm, key);
             release();
         });
-        if queued.is_err() && changed {
+        if queued.is_err() {
             FOCUSING.store(false, Ordering::SeqCst);
         }
     }
@@ -810,6 +815,243 @@ pub fn switch_pin_group(app: &AppHandle) {
     });
 }
 
+const SCROLL_FRAME: &str = "scroll-frame";
+const SCROLL_HUD: &str = "scroll-hud";
+const HUD_W: f64 = 480.0;
+const HUD_H: f64 = 58.0;
+const FRAME_PAD: i32 = 8;
+
+#[derive(Clone, Copy)]
+struct FramePlace {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    hole_x: i32,
+    hole_y: i32,
+    hole_w: u32,
+    hole_h: u32,
+}
+
+/// Green ring around the selection. The center is a hole so the scrollbar underneath can be dragged.
+fn frame_place(sel_x: i32, sel_y: i32, sel_w: u32, sel_h: u32, screen_x: i32, screen_y: i32, screen_w: u32, screen_h: u32, pad: i32) -> Option<FramePlace> {
+    if sel_w == 0 || sel_h == 0 || screen_w == 0 || screen_h == 0 || pad <= 0 {
+        return None;
+    }
+    let screen_r = screen_x.saturating_add(screen_w as i32);
+    let screen_b = screen_y.saturating_add(screen_h as i32);
+    let left = (sel_x - pad).max(screen_x);
+    let top = (sel_y - pad).max(screen_y);
+    let right = (sel_x.saturating_add(sel_w as i32).saturating_add(pad)).min(screen_r);
+    let bottom = (sel_y.saturating_add(sel_h as i32).saturating_add(pad)).min(screen_b);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let hole_x = (sel_x - left).max(0);
+    let hole_y = (sel_y - top).max(0);
+    let hole_r = (sel_x.saturating_add(sel_w as i32) - left).clamp(hole_x, right - left);
+    let hole_b = (sel_y.saturating_add(sel_h as i32) - top).clamp(hole_y, bottom - top);
+    if hole_r <= hole_x || hole_b <= hole_y {
+        return None;
+    }
+    let ring = hole_x > 1 || hole_y > 1 || (right - left) - hole_r > 1 || (bottom - top) - hole_b > 1;
+    if !ring {
+        return None;
+    }
+    Some(FramePlace {
+        x: left,
+        y: top,
+        w: (right - left) as u32,
+        h: (bottom - top) as u32,
+        hole_x,
+        hole_y,
+        hole_w: (hole_r - hole_x) as u32,
+        hole_h: (hole_b - hole_y) as u32,
+    })
+}
+
+fn hud_place(sel_x: i32, sel_y: i32, sel_w: u32, sel_h: u32, screen_x: i32, screen_y: i32, screen_w: u32, screen_h: u32, hud_w: i32, hud_h: i32) -> (i32, i32) {
+    let screen_r = screen_x.saturating_add(screen_w as i32);
+    let screen_b = screen_y.saturating_add(screen_h as i32);
+    let max_x = (screen_r - hud_w - 4).max(screen_x);
+    let max_y = (screen_b - hud_h - 4).max(screen_y);
+    let mut x = sel_x + (sel_w as i32 - hud_w) / 2;
+    let below = sel_y.saturating_add(sel_h as i32).saturating_add(12);
+    let above = sel_y - 12 - hud_h;
+    let y = if below.saturating_add(hud_h) <= screen_b - 4 {
+        below
+    } else if above >= screen_y + 4 {
+        above
+    } else {
+        screen_y + 8
+    };
+    let min_x = (screen_x + 4).min(max_x);
+    let min_y = screen_y.min(max_y);
+    x = x.clamp(min_x, max_x);
+    (x, y.clamp(min_y, max_y))
+}
+
+pub fn conceal_visible_overlays(app: &AppHandle) -> Vec<String> {
+    let mut shown = Vec::new();
+    for label in overlay_labels(app) {
+        let Some(window) = app.get_webview_window(&label) else { continue };
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            shown.push(label);
+        }
+    }
+    shown
+}
+
+pub fn show_overlay_labels(app: &AppHandle, labels: &[String]) {
+    for label in labels {
+        let Some(window) = app.get_webview_window(label) else { continue };
+        let _ = window.show();
+        let _ = window.set_always_on_top(true);
+    }
+}
+
+pub fn close_scroll_chrome(app: &AppHandle) {
+    for label in [SCROLL_FRAME, SCROLL_HUD] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.destroy();
+        }
+    }
+}
+
+pub fn open_scroll_chrome(
+    app: &AppHandle,
+    sel_x: i32,
+    sel_y: i32,
+    sel_w: u32,
+    sel_h: u32,
+    screen_x: i32,
+    screen_y: i32,
+    screen_w: u32,
+    screen_h: u32,
+) -> Result<(), String> {
+    close_scroll_chrome(app);
+    if let Some(place) = frame_place(sel_x, sel_y, sel_w, sel_h, screen_x, screen_y, screen_w, screen_h, FRAME_PAD) {
+        open_scroll_frame(app, place)?;
+    }
+    open_scroll_hud(app, sel_x, sel_y, sel_w, sel_h, screen_x, screen_y, screen_w, screen_h)
+}
+
+fn open_scroll_frame(app: &AppHandle, place: FramePlace) -> Result<(), String> {
+    let window = WebviewWindowBuilder::new(app, SCROLL_FRAME, view_url("view=scroll&role=frame"))
+        .title("Shotlet")
+        .decorations(false)
+        .resizable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .focused(false)
+        .shadow(false)
+        .transparent(true)
+        .accept_first_mouse(true)
+        .background_color(tauri::utils::config::Color(0, 0, 0, 0))
+        .inner_size(place.w as f64, place.h as f64)
+        .initialization_script(
+            "document.documentElement.style.background='transparent';document.addEventListener('DOMContentLoaded',function(){document.body.style.margin='0';document.body.style.background='transparent';});",
+        )
+        .on_page_load(move |window, payload| {
+            if !matches!(payload.event(), PageLoadEvent::Finished) {
+                return;
+            }
+            let _ = window.set_position(PhysicalPosition::new(place.x, place.y));
+            let _ = window.set_size(PhysicalSize::new(place.w, place.h));
+            clip_frame_ring(&window, place.w, place.h, place.hole_x, place.hole_y, place.hole_w, place.hole_h);
+            let _ = window.set_ignore_cursor_events(true);
+            let _ = window.show();
+        })
+        .build()
+        .map_err(err)?;
+    let _ = window.set_position(PhysicalPosition::new(place.x, place.y));
+    let _ = window.set_size(PhysicalSize::new(place.w, place.h));
+    clip_frame_ring(&window, place.w, place.h, place.hole_x, place.hole_y, place.hole_w, place.hole_h);
+    let _ = window.set_ignore_cursor_events(true);
+    window.show().map_err(err)?;
+    Ok(())
+}
+
+fn open_scroll_hud(
+    app: &AppHandle,
+    sel_x: i32,
+    sel_y: i32,
+    sel_w: u32,
+    sel_h: u32,
+    screen_x: i32,
+    screen_y: i32,
+    screen_w: u32,
+    screen_h: u32,
+) -> Result<(), String> {
+    let window = WebviewWindowBuilder::new(app, SCROLL_HUD, view_url("view=scroll&role=hud"))
+        .title("Shotlet")
+        .decorations(false)
+        .resizable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .focused(false)
+        .shadow(false)
+        .transparent(true)
+        .accept_first_mouse(true)
+        .background_color(tauri::utils::config::Color(255, 255, 255, 255))
+        .inner_size(HUD_W, HUD_H)
+        .initialization_script(
+            "document.documentElement.style.background='transparent';document.addEventListener('DOMContentLoaded',function(){document.body.style.margin='0';document.body.style.background='transparent';});",
+        )
+        .on_page_load(|window, payload| {
+            if !matches!(payload.event(), PageLoadEvent::Finished) {
+                return;
+            }
+            let _ = window.show();
+        })
+        .build()
+        .map_err(err)?;
+    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+    let hud_w = (HUD_W * scale).round() as i32;
+    let hud_h = (HUD_H * scale).round() as i32;
+    let (x, y) = hud_place(sel_x, sel_y, sel_w, sel_h, screen_x, screen_y, screen_w, screen_h, hud_w, hud_h);
+    window.set_position(PhysicalPosition::new(x, y)).map_err(err)?;
+    window.show().map_err(err)?;
+    eprintln!("scroll: hud at {x},{y}");
+    Ok(())
+}
+
+fn clip_frame_ring(window: &WebviewWindow, width: u32, height: u32, hole_x: i32, hole_y: i32, hole_w: u32, hole_h: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF};
+        let Ok(hwnd) = window.hwnd() else { return };
+        unsafe {
+            let full = CreateRectRgn(0, 0, width as i32, height as i32);
+            let hole = CreateRectRgn(hole_x, hole_y, hole_x.saturating_add(hole_w as i32), hole_y.saturating_add(hole_h as i32));
+            let ring = CreateRectRgn(0, 0, 0, 0);
+            if full.is_invalid() || hole.is_invalid() || ring.is_invalid() {
+                if !full.is_invalid() { let _ = DeleteObject(full.into()); }
+                if !hole.is_invalid() { let _ = DeleteObject(hole.into()); }
+                if !ring.is_invalid() { let _ = DeleteObject(ring.into()); }
+                return;
+            }
+            let combined = CombineRgn(Some(ring), Some(full), Some(hole), RGN_DIFF);
+            let _ = DeleteObject(full.into());
+            let _ = DeleteObject(hole.into());
+            if combined.0 == 0 {
+                let _ = DeleteObject(ring.into());
+                return;
+            }
+            if SetWindowRgn(hwnd, Some(ring), true) == 0 {
+                let _ = DeleteObject(ring.into());
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, width, height, hole_x, hole_y, hole_w, hole_h);
+    }
+}
+
 fn set_pin_visibility(app: &AppHandle, group: u8, groups: &HashMap<String, u8>, show_current: bool) {
     for (label, window) in app.webview_windows() {
         let Some(id) = label.strip_prefix("pin-") else {
@@ -956,4 +1198,29 @@ pub fn app_data_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
 
 pub fn read_settings(app: &AppHandle) -> Result<Settings, String> {
     Ok(app.state::<AppState>().settings.lock().map_err(err)?.clone())
+}
+
+#[cfg(test)]
+mod scroll_chrome_tests {
+    use super::{frame_place, hud_place};
+
+    #[test]
+    fn frame_is_a_ring_outside_the_selection() {
+        let place = frame_place(100, 80, 400, 300, 0, 0, 1920, 1080, 8).unwrap();
+        assert_eq!((place.x, place.y, place.w, place.h), (92, 72, 416, 316));
+        assert_eq!((place.hole_x, place.hole_y, place.hole_w, place.hole_h), (8, 8, 400, 300));
+    }
+
+    #[test]
+    fn frame_is_skipped_when_the_selection_fills_the_screen() {
+        assert!(frame_place(0, 0, 1920, 1080, 0, 0, 1920, 1080, 8).is_none());
+    }
+
+    #[test]
+    fn hud_sits_under_the_selection_and_moves_above_when_it_does_not_fit() {
+        assert_eq!(hud_place(100, 80, 400, 200, 0, 0, 1920, 1080, 480, 58), (60, 292));
+        let (x, y) = hud_place(100, 900, 400, 150, 0, 0, 1920, 1080, 480, 58);
+        assert_eq!(y, 900 - 12 - 58);
+        assert_eq!(x, 60);
+    }
 }

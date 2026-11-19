@@ -36,6 +36,8 @@ export type ScreenImage = {
   path: string;
   screenX: number;
   screenY: number;
+  pointWidth?: number;
+  pointHeight?: number;
   windows?: WindowInfo[];
 };
 

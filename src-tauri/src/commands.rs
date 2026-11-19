@@ -568,28 +568,94 @@ pub fn current_editor(state: State<AppState>) -> Result<Option<EditorView>, Stri
     }))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrollRequest {
+    pub screen_x: i32,
+    pub screen_y: i32,
+    pub screen_w: u32,
+    pub screen_h: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub image_w: u32,
+    pub image_h: u32,
+    pub point_w: u32,
+    pub point_h: u32,
+}
+
 #[tauri::command]
-pub async fn scroll_capture(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<EditorView, String> {
-    if let Err(error) = scroll::ensure_scroll_access() {
-        let _ = app.emit("capture-error", error.clone());
+pub fn scroll_finish() {
+    scroll::request_finish();
+}
+
+#[tauri::command]
+pub fn scroll_cancel() {
+    scroll::request_cancel();
+}
+
+#[tauri::command]
+pub fn scroll_progress() -> u32 {
+    scroll::progress()
+}
+
+#[tauri::command]
+pub async fn scroll_capture(app: AppHandle, request: ScrollRequest) -> Result<EditorView, String> {
+    let x = request.x.max(0) as u32;
+    let y = request.y.max(0) as u32;
+    let width = request.width;
+    let height = request.height;
+    if width < 20 || height < 20 {
+        return Err("滚动选区太小".into());
+    }
+    scroll::begin()?;
+    let (vx, vy, vw, vh) = scroll::visual_rect(
+        request.screen_x,
+        request.screen_y,
+        x,
+        y,
+        width,
+        height,
+        request.image_w,
+        request.image_h,
+        request.point_w,
+        request.point_h,
+    );
+    let screen_x = request.screen_x;
+    let screen_y = request.screen_y;
+    let screen_w = request.screen_w;
+    let screen_h = request.screen_h;
+    eprintln!("scroll: open chrome at {vx},{vy} {vw}x{vh} on {screen_x},{screen_y} {screen_w}x{screen_h}");
+    if let Err(error) = ui::on_main_wait_for(&app, std::time::Duration::from_secs(8), move |app| {
+        ui::open_scroll_chrome(app, vx, vy, vw, vh, screen_x, screen_y, screen_w, screen_h)
+    }) {
+        eprintln!("scroll: chrome failed: {error}");
+        scroll::end();
+        let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
         return Err(error);
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let app_hide = app.clone();
-    app.run_on_main_thread(move || {
-        ui::hide_overlay(&app_hide);
-        let _ = tx.send(());
-    })
-    .map_err(err)?;
-    let _ = rx.recv();
-    std::thread::sleep(std::time::Duration::from_millis(190));
-    let captured = tauri::async_runtime::spawn_blocking(move || scroll::capture_scrolled(x, y, width, height)).await;
+    let hidden = match ui::on_main_wait_for(&app, std::time::Duration::from_secs(8), |app| ui::conceal_visible_overlays(app)) {
+        Ok(labels) => labels,
+        Err(error) => {
+            eprintln!("scroll: hide overlay failed: {error}");
+            scroll::end();
+            let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
+            return Err(error);
+        }
+    };
+    std::thread::sleep(std::time::Duration::from_millis(160));
+    let captured = tauri::async_runtime::spawn_blocking(move || scroll::capture_manual(screen_x, screen_y, x, y, width, height)).await;
+    scroll::end();
+    let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
     let result = match captured.map_err(err).and_then(|inner| inner) {
         Ok(result) => result,
         Err(error) => {
-            ui::close_overlay(&app);
-            let _ = app.emit("capture-error", error.clone());
-            ui::open_home(&app);
+            let labels = hidden;
+            let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), move |app| ui::show_overlay_labels(app, &labels));
+            if error != scroll::CANCELLED {
+                let _ = app.emit("capture-error", error.clone());
+            }
             return Err(error);
         }
     };

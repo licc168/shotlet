@@ -163,6 +163,13 @@ export function Overlay() {
       .sort((a, b) => a.z - b.z);
   }
 
+  function windowUnder(x: number, y: number): WindowInfo | null {
+    const windows = windowsAt(x, y);
+    if (!windows.length) return null;
+    const index = ((hover % windows.length) + windows.length) % windows.length;
+    return windows[index] ?? null;
+  }
+
   function sampleHex(point: { x: number; y: number }) {
     if (!image) return "#000000";
     const canvas = sampleRef.current ?? document.createElement("canvas");
@@ -201,8 +208,7 @@ export function Overlay() {
     return <div className="overlay-root" />;
   }
   const screen = found;
-  const pointWindows = cursor ? windowsAt(cursor.x, cursor.y) : [];
-  const active = pointWindows.length ? pointWindows[hover % pointWindows.length] : null;
+  const active = cursor ? windowUnder(cursor.x, cursor.y) : null;
   const live = draft ?? (active ? { x: active.x, y: active.y, w: active.width, h: active.height } : null);
   const shot = image;
 
@@ -254,17 +260,23 @@ export function Overlay() {
     raf.current = 0;
     const region = draftRef.current;
     const moved = drag.current.moved;
+    const start = { x: drag.current.x, y: drag.current.y };
     drag.current = null;
     if (moved && region && region.w > 4 && region.h > 4) {
       const next = clampRect(region, { x: 0, y: 0, w: shot.naturalWidth, h: shot.naturalHeight });
       if (capture?.mode === "copy") void finishCopy(next);
       else setSelection(next);
-    } else {
-      updateDraft(null);
-      // A click that does not finish a selection should keep following the pointer
-      // onto the other display. Follow is only for the screen that started the shot.
-      void setOverlayFollow(true);
+      return;
     }
+    updateDraft(null);
+    const target = windowUnder(start.x, start.y);
+    if (!target) {
+      void setOverlayFollow(true);
+      return;
+    }
+    const next = { x: target.x, y: target.y, w: target.width, h: target.height };
+    if (capture?.mode === "copy") void finishCopy(next);
+    else setSelection(next);
   }
   endDrag.current = commitDrag;
 
@@ -350,13 +362,24 @@ export function Overlay() {
           onScroll={() => {
             if (scrolling.current) return;
             scrolling.current = true;
-            const x = Math.round(screen.screenX + selection.x);
-            const y = Math.round(screen.screenY + selection.y);
-            const w = Math.round(selection.w);
-            const h = Math.round(selection.h);
-            void scrollCapture(x, y, w, h)
+            void scrollCapture({
+              screenX: screen.screenX,
+              screenY: screen.screenY,
+              screenW: screen.pointWidth || image.naturalWidth,
+              screenH: screen.pointHeight || image.naturalHeight,
+              x: Math.round(selection.x),
+              y: Math.round(selection.y),
+              width: Math.round(selection.w),
+              height: Math.round(selection.h),
+              imageW: image.naturalWidth,
+              imageH: image.naturalHeight,
+              pointW: screen.pointWidth || image.naturalWidth,
+              pointH: screen.pointHeight || image.naturalHeight,
+            })
               .catch((reason: unknown) => {
-                setError(reason instanceof Error ? reason.message : String(reason));
+                const message = reason instanceof Error ? reason.message : String(reason);
+                if (message.includes("已取消")) return;
+                setError(message);
               })
               .finally(() => {
                 scrolling.current = false;
@@ -426,12 +449,6 @@ export function Overlay() {
         }}
         onPointerUp={() => commitDrag()}
         onPointerCancel={() => commitDrag()}
-        onDoubleClick={(event) => {
-          const point = toImage(event);
-          const windows = windowsAt(point.x, point.y);
-          const target = windows[hover % Math.max(windows.length, 1)];
-          if (target) setSelection({ x: target.x, y: target.y, w: target.width, h: target.height });
-        }}
         onWheel={(event) => {
           if (!drag.current) setHover((value) => value + (event.deltaY > 0 ? 1 : -1));
         }}
@@ -455,7 +472,7 @@ export function Overlay() {
       </div>
       )}
       {error
-        ? <p className="overlay-hint">{error}</p>
+        ? <p className="overlay-hint error">{error}</p>
         : !selection && armed && <p className="overlay-hint">{capture.mode === "copy" ? t("hintCopy") : t("hintPick")}</p>}
     </div>
   );

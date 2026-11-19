@@ -88,7 +88,80 @@ pub fn monitor_at_point(rects: &[MonitorRect], x: i32, y: i32) -> Option<Monitor
     rects
         .iter()
         .copied()
-        .find(|rect| x >= rect.x && y >= rect.y && x < rect.x + rect.width as i32 && y < rect.y + rect.height as i32)
+        .filter(|rect| x >= rect.x && y >= rect.y && x < rect.x + rect.width as i32 && y < rect.y + rect.height as i32)
+        // A scaled primary can report a rect that also contains the next display.
+        // The smaller one is the display the pointer is actually on.
+        .min_by_key(|rect| u64::from(rect.width) * u64::from(rect.height))
+}
+
+/// Monitor rectangles in the same coordinate space as `GetCursorPos`.
+/// `xcap` device mode can be larger than that slot and make the left screen swallow the right one.
+#[cfg(windows)]
+fn cursor_space_monitors() -> Vec<(String, MonitorRect)> {
+    use std::mem::{size_of, zeroed};
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW};
+
+    unsafe extern "system" fn each(monitor: HMONITOR, _dc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
+        unsafe {
+        let list = &mut *(data.0 as *mut Vec<(String, MonitorRect)>);
+        let mut info: MONITORINFOEXW = zeroed();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+            let name = String::from_utf16_lossy(&info.szDevice)
+                .trim_end_matches('\0')
+                .to_string();
+            let bounds = info.monitorInfo.rcMonitor;
+            let width = bounds.right.saturating_sub(bounds.left);
+            let height = bounds.bottom.saturating_sub(bounds.top);
+            if width > 0 && height > 0 {
+                list.push((
+                    name,
+                    MonitorRect {
+                        x: bounds.left,
+                        y: bounds.top,
+                        width: width as u32,
+                        height: height as u32,
+                    },
+                ));
+            }
+        }
+        BOOL(1)
+        }
+    }
+
+    let mut list = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut list as *mut _ as isize));
+    }
+    list
+}
+
+#[cfg(not(windows))]
+fn cursor_space_monitors() -> Vec<(String, MonitorRect)> {
+    Vec::new()
+}
+
+fn cursor_space_for(name: &str, fallback: MonitorRect, os: &[(String, MonitorRect)]) -> MonitorRect {
+    os.iter()
+        .find(|(device, _)| device == name)
+        .map(|(_, rect)| *rect)
+        .unwrap_or(fallback)
+}
+
+fn scale_windows_to_image(windows: &mut [WindowInfo], slot_w: u32, slot_h: u32, image_w: u32, image_h: u32) {
+    if slot_w == 0 || slot_h == 0 || (slot_w == image_w && slot_h == image_h) {
+        return;
+    }
+    let sx = image_w as f32 / slot_w as f32;
+    let sy = image_h as f32 / slot_h as f32;
+    for window in windows {
+        window.x = (window.x as f32 * sx).round() as i32;
+        window.y = (window.y as f32 * sy).round() as i32;
+        window.width = (window.width as f32 * sx).round().max(1.0) as i32;
+        window.height = (window.height as f32 * sy).round().max(1.0) as i32;
+    }
 }
 
 fn intersects_local(x: i32, y: i32, w: i32, h: i32, width: i32, height: i32) -> bool {
@@ -110,6 +183,7 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
         return Err("没有找到显示器".into());
     }
     monitors.sort_by_key(|monitor| (monitor.x().unwrap_or(i32::MAX), monitor.y().unwrap_or(i32::MAX)));
+    let os_monitors = cursor_space_monitors();
     let mut screens = Vec::new();
     let mut packed_x: i32 = 0;
     let mut chosen: Option<usize> = None;
@@ -121,6 +195,11 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
         if point_w == 0 || point_h == 0 {
             continue;
         }
+        let slot = cursor_space_for(
+            &monitor.name().unwrap_or_default(),
+            MonitorRect { x: sx, y: sy, width: point_w, height: point_h },
+            &os_monitors,
+        );
         let Ok(image) = monitor.capture_image() else { continue };
         let width = image.width();
         let height = image.height();
@@ -130,9 +209,10 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
         let path = capture_dir().join(format!("freeze-{}.png", new_id()));
         write_png(&path, &image)?;
         // Window positions share the monitor's point space, which is not the packed crop origin.
-        let mut windows = windows_list::list_windows(sx, sy, point_w as i32, point_h as i32);
-        windows.retain(|window| intersects_local(window.x, window.y, window.width, window.height, point_w as i32, point_h as i32));
-        if cursor_x >= sx && cursor_y >= sy && cursor_x < sx + point_w as i32 && cursor_y < sy + point_h as i32 {
+        let mut windows = windows_list::list_windows(slot.x, slot.y, slot.width as i32, slot.height as i32);
+        windows.retain(|window| intersects_local(window.x, window.y, window.width, window.height, slot.width as i32, slot.height as i32));
+        scale_windows_to_image(&mut windows, slot.width, slot.height, width, height);
+        if cursor_x >= slot.x && cursor_y >= slot.y && cursor_x < slot.x + slot.width as i32 && cursor_y < slot.y + slot.height as i32 {
             chosen = Some(screens.len());
         }
         screens.push(ScreenImage {
@@ -140,11 +220,11 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
             y: 0,
             width,
             height,
-            point_width: point_w,
-            point_height: point_h,
+            point_width: slot.width,
+            point_height: slot.height,
             path: path.to_string_lossy().to_string(),
-            screen_x: sx,
-            screen_y: sy,
+            screen_x: slot.x,
+            screen_y: slot.y,
             windows,
         });
         packed_x = packed_x.saturating_add(width as i32);
@@ -312,6 +392,39 @@ pub fn crop_frozen(image: &RgbaImage, x: i32, y: i32, width: u32, height: u32) -
     Ok(imageops::crop_imm(image, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).to_image())
 }
 
+/// Capture a rectangle in one monitor's image pixels.
+/// `screen_x` / `screen_y` are that monitor's origin in cursor space, the same values stored on a frozen screen.
+pub fn capture_local(screen_x: i32, screen_y: i32, x: u32, y: u32, width: u32, height: u32) -> Result<RgbaImage, String> {
+    if width == 0 || height == 0 {
+        return Err("选区尺寸无效".into());
+    }
+    let monitors = Monitor::all().map_err(err)?;
+    let os = cursor_space_monitors();
+    for monitor in monitors {
+        let Ok(mx) = monitor.x() else { continue };
+        let Ok(my) = monitor.y() else { continue };
+        let Ok(mw) = monitor.width() else { continue };
+        let Ok(mh) = monitor.height() else { continue };
+        if mw == 0 || mh == 0 {
+            continue;
+        }
+        let slot = cursor_space_for(
+            &monitor.name().unwrap_or_default(),
+            MonitorRect { x: mx, y: my, width: mw, height: mh },
+            &os,
+        );
+        if slot.x != screen_x || slot.y != screen_y {
+            continue;
+        }
+        let x0 = x.min(mw.saturating_sub(1));
+        let y0 = y.min(mh.saturating_sub(1));
+        let w = width.min(mw.saturating_sub(x0)).max(1);
+        let h = height.min(mh.saturating_sub(y0)).max(1);
+        return monitor.capture_region(x0, y0, w, h).map_err(err);
+    }
+    capture_rect(screen_x.saturating_add(x as i32), screen_y.saturating_add(y as i32), width, height)
+}
+
 pub fn capture_rect(x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage, String> {
     if width == 0 || height == 0 || width > 16000 || height > 16000 {
         return Err("选区尺寸无效".into());
@@ -376,6 +489,11 @@ mod tests {
         assert_eq!(super::monitor_at_point(&rects, 2000, 40).unwrap().x, 1920);
         assert_eq!(super::monitor_at_point(&rects, 1919, 1079).unwrap().x, 0);
         assert!(super::monitor_at_point(&rects, 1920, 1080).is_none());
+        let overlapping = vec![
+            super::MonitorRect { x: 0, y: 0, width: 3000, height: 1080 },
+            super::MonitorRect { x: 1920, y: 0, width: 1920, height: 1080 },
+        ];
+        assert_eq!(super::monitor_at_point(&overlapping, 2000, 40).unwrap().x, 1920);
     }
 
     #[test]

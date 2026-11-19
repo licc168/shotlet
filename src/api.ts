@@ -310,12 +310,42 @@ export async function currentEditor(idFromQuery: string | null): Promise<EditorP
   return call<EditorPayload | null>("current_editor");
 }
 
-export async function scrollCapture(x: number, y: number, width: number, height: number): Promise<void> {
+export type ScrollRequest = {
+  screenX: number;
+  screenY: number;
+  screenW: number;
+  screenH: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  imageW: number;
+  imageH: number;
+  pointW: number;
+  pointH: number;
+};
+
+export async function scrollCapture(request: ScrollRequest): Promise<void> {
   if (!isTauri()) {
-    window.alert("滚动长截图需要桌面端，它会在真实屏幕上滚动并拼接。");
+    window.alert("滚动长截图需要桌面端。框住内容后，自己拖动选区里的滚动条。");
     return;
   }
-  await call("scroll_capture", { x, y, width, height });
+  await call("scroll_capture", { request });
+}
+
+export async function finishScroll(): Promise<void> {
+  if (!isTauri()) return;
+  await call("scroll_finish");
+}
+
+export async function cancelScroll(): Promise<void> {
+  if (!isTauri()) return;
+  await call("scroll_cancel");
+}
+
+export async function scrollProgress(): Promise<number> {
+  if (!isTauri()) return 0;
+  return call<number>("scroll_progress");
 }
 
 export async function ffmpegAvailable(): Promise<boolean> {
