@@ -66,10 +66,26 @@ fn set_revealed(label: &str, on: bool) {
 
 fn overlay_on_screen(window: &WebviewWindow) -> bool {
     if overlay_uses_cloak() {
-        revealed_labels().lock().map(|labels| labels.contains(window.label())).unwrap_or(false)
-    } else {
+        return revealed_labels().lock().map(|labels| labels.contains(window.label())).unwrap_or(false);
+    }
+    // AppKit isVisible stays true after the window server drops the other display.
+    // Follow that and the pointer move never puts the mask back.
+    #[cfg(target_os = "macos")]
+    {
+        return mac_overlay_composited(window);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         window.is_visible().unwrap_or(false)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_overlay_composited(window: &WebviewWindow) -> bool {
+    let Ok(raw) = window.ns_window() else {
+        return false;
+    };
+    unsafe { shotlet_overlay_onscreen(raw) != 0 }
 }
 
 fn place_if_moved(window: &WebviewWindow, x: i32, y: i32, width: u32, height: u32) {
@@ -333,7 +349,7 @@ pub fn conceal_overlays(app: &AppHandle) -> bool {
             park_overlay(&window);
             let _ = app.emit_to(&label, "overlay-hide", ());
         } else {
-            let _ = window.hide();
+            hide_overlay_window(&window);
         }
     }
     if covered && overlay_uses_cloak() {
@@ -494,6 +510,17 @@ unsafe extern "C" {
         height: f64,
         make_key: i32,
     ) -> i32;
+    fn shotlet_cancel_overlay(window: *mut std::ffi::c_void);
+    fn shotlet_overlay_onscreen(window: *mut std::ffi::c_void) -> i32;
+}
+
+fn hide_overlay_window(window: &WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    if let Ok(raw) = window.ns_window() {
+        // Drop the pending re-show. Do not swallow orderOut; that aborts on macOS 26.
+        unsafe { shotlet_cancel_overlay(raw) };
+    }
+    let _ = window.hide();
 }
 
 fn point_size_of(screen: &capture::ScreenImage) -> (u32, u32) {
@@ -550,7 +577,9 @@ fn show_overlay_screen(app: &AppHandle, screens: &[capture::ScreenImage], index:
     };
     #[cfg(target_os = "macos")]
     {
+        // set_focus() calls makeKeyAndOrderFront and aborts on macOS 26.
         let _ = place_mac_overlay(&window, &place, make_key);
+        return;
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -562,9 +591,9 @@ fn show_overlay_screen(app: &AppHandle, screens: &[capture::ScreenImage], index:
         }
         let _ = move_overlay_window(&window, &place);
         let _ = window.show();
-    }
-    if make_key {
-        let _ = window.set_focus();
+        if make_key {
+            let _ = window.set_focus();
+        }
     }
 }
 
@@ -632,10 +661,9 @@ fn place_overlay_window(window: &WebviewWindow, place: &OverlayPlace, focus: boo
     // stays invisible, so the pointer can never select it.
     #[cfg(target_os = "macos")]
     {
+        // Do not set_focus here. tao turns that into makeKeyAndOrderFront,
+        // which aborts on macOS 26 while the overlay webview becomes key.
         place_mac_overlay(window, place, focus)?;
-        if focus {
-            let _ = window.set_focus();
-        }
         return Ok(());
     }
     #[cfg(not(target_os = "macos"))]
@@ -694,7 +722,7 @@ fn hide_extra_overlays(app: &AppHandle, count: usize) {
         if overlay_uses_cloak() {
             park_overlay(&window);
         } else {
-            let _ = window.hide();
+            hide_overlay_window(&window);
         }
         slot += 1;
     }
@@ -723,7 +751,18 @@ fn escape_key_down() -> bool {
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
         return unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) } < 0;
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+        }
+        // kCGEventSourceStateHIDSystemState = 1, kVK_Escape = 53.
+        // The overlay is not made key (that aborts on macOS 26), so the page
+        // never sees Esc. Poll it here instead.
+        return unsafe { CGEventSourceKeyState(1, 53) };
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         false
     }
@@ -731,11 +770,9 @@ fn escape_key_down() -> bool {
 
 fn follow_loop(app: AppHandle) {
     static FOCUSING: AtomicBool = AtomicBool::new(false);
-    let mut stable: Option<(i32, i32)> = None;
-    let mut stable_hits = 0u8;
     let mut escape_was_down = false;
     loop {
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(16));
         let escape_down = escape_key_down();
         let escape_hit = escape_down && !escape_was_down;
         escape_was_down = escape_down;
@@ -744,14 +781,10 @@ fn follow_loop(app: AppHandle) {
         if escape_hit && OVERLAY_OPEN.load(Ordering::Relaxed) && !overlay_has_foreground() {
             let app_for_close = app.clone();
             let _ = app.run_on_main_thread(move || dismiss_overlay(&app_for_close));
-            stable = None;
-            stable_hits = 0;
             continue;
         }
         let state = app.state::<AppState>();
         if !state.overlay_follow.load(Ordering::Relaxed) {
-            stable = None;
-            stable_hits = 0;
             continue;
         }
         let screens = match state.capture.lock() {
@@ -765,29 +798,16 @@ fn follow_loop(app: AppHandle) {
         let rects = rects_of(&screens);
         let Some(monitor) = capture::monitor_at_point(&rects, cursor_x, cursor_y) else { continue };
         let key = (monitor.x, monitor.y);
-        if stable == Some(key) {
-            stable_hits = stable_hits.saturating_add(1);
-        } else {
-            stable = Some(key);
-            stable_hits = 1;
-        }
-        if stable_hits < 2 {
-            continue;
-        }
         let aimed = state.overlay_aim.lock().ok().and_then(|slot| *slot);
         if aimed == Some(key) {
             continue;
         }
         let generation = state.overlay_generation.load(Ordering::Relaxed);
         drop(state);
-        let Some(index) = screens.iter().position(|screen| screen.screen_x == key.0 && screen.screen_y == key.1) else {
-            continue;
-        };
         if FOCUSING.swap(true, Ordering::SeqCst) {
             continue;
         }
         let app_for_window = app.clone();
-        let screens_for_arm = screens;
         let queued = app_for_window.clone().run_on_main_thread(move || {
             let release = || FOCUSING.store(false, Ordering::SeqCst);
             let state = app_for_window.state::<AppState>();
@@ -795,6 +815,28 @@ fn follow_loop(app: AppHandle) {
                 release();
                 return;
             }
+            let screens = match state.capture.lock() {
+                Ok(slot) => slot.as_ref().map(|item| item.screens.clone()).unwrap_or_default(),
+                Err(_) => {
+                    release();
+                    return;
+                }
+            };
+            // Read the pointer again. The queued key is already stale if the mouse kept moving.
+            let Some((cursor_x, cursor_y)) = capture::cursor_point() else {
+                release();
+                return;
+            };
+            let rects = rects_of(&screens);
+            let Some(monitor) = capture::monitor_at_point(&rects, cursor_x, cursor_y) else {
+                release();
+                return;
+            };
+            let key = (monitor.x, monitor.y);
+            let Some(index) = screens.iter().position(|screen| screen.screen_x == key.0 && screen.screen_y == key.1) else {
+                release();
+                return;
+            };
             if app_for_window.get_webview_window(&overlay_label(index)).is_none() {
                 release();
                 return;
@@ -809,11 +851,15 @@ fn follow_loop(app: AppHandle) {
                 *aim = Some(key);
             }
             drop(state);
-            // Show the other displays first, then key the one under the pointer.
-            // Repeating this while the pointer stays steals focus and flashes the freeze.
-            raise_hidden_overlays(&app_for_window, &screens_for_arm, index);
-            focus_overlay(&app_for_window, &screens_for_arm, index);
-            emit_overlay_arm(&app_for_window, &screens_for_arm, key);
+            // Highlight first. Putting the mask back is separate and must not
+            // wait on another mouse wiggle, or steal focus on the way.
+            emit_overlay_arm(&app_for_window, &screens, key);
+            raise_hidden_overlays(&app_for_window, &screens, index);
+            if let Some(window) = app_for_window.get_webview_window(&overlay_label(index)) {
+                if !overlay_on_screen(&window) {
+                    show_overlay_screen(&app_for_window, &screens, index, false);
+                }
+            }
             release();
         });
         if queued.is_err() {
@@ -859,7 +905,7 @@ fn dismiss_overlay(app: &AppHandle) {
                 park_overlay(&window);
                 let _ = app.emit_to(&label, "overlay-hide", ());
             } else {
-                let _ = window.hide();
+                hide_overlay_window(&window);
             }
         }
     }
@@ -1665,7 +1711,7 @@ pub fn conceal_visible_overlays(app: &AppHandle) -> Vec<String> {
         if overlay_uses_cloak() {
             park_overlay(&window);
         } else {
-            let _ = window.hide();
+            hide_overlay_window(&window);
         }
         shown.push(label);
     }
