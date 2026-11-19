@@ -1,0 +1,13 @@
+[package]
+name = "shotlet-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Shotlet session state and the only crate the desktop shell calls."
+
+[dependencies]
+serde.workspace = true
+shotlet-capture.workspace = true
+shotlet-media.workspace = true
+shotlet-platform.workspace = true
+shotlet-store.workspace = true

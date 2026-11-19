@@ -64,7 +64,6 @@ export function SettingsView() {
   return (
     <main className="settings">
       <header>
-        <p className="mark">Shotlet</p>
         <h1>{t("settings")}</h1>
       </header>
       <section className="panel">

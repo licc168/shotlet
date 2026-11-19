@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { getSettings, saveSettings } from "./api";
+import { getSettings, onEvent, saveSettings } from "./api";
 import { defaultSettings, type Settings } from "./types";
 
 const copy = {
@@ -16,7 +16,11 @@ const copy = {
   pin: ["贴图", "Pin"],
   ocr: ["识别文字", "OCR"],
   scroll: ["滚动截图", "Scroll capture"],
-  scrollHint: ["在绿框里拖动滚动条。点完成后拼接，Esc 取消。", "Drag the scrollbar inside the green frame. Done stitches it. Esc cancels."],
+  scrollHint: ["滚动页面截取更多内容", "Scroll to capture more"],
+  scrollReverse: ["不支持反向滚动", "Reverse scroll blocked"],
+  scrollEdit: ["编辑长图", "Edit"],
+  scrollSave: ["保存长图", "Save"],
+  scrollCopy: ["完成并复制", "Copy"],
   scrollStitched: ["已拼接", "Stitched"],
   record: ["录制", "Record"],
   recordFormat: ["格式", "Format"],
@@ -28,7 +32,11 @@ const copy = {
   recordShow: ["显示", "Show"],
   recordHide: ["隐藏", "Hide"],
   recordStart: ["开始录制", "Start recording"],
-  recordGifSilent: ["GIF 不录音", "GIF has no audio"],
+  recordGifSilent: ["GIF 不包含声音", "GIF does not contain audio"],
+  recordPause: ["暂停录制", "Pause"],
+  recordResume: ["继续录制", "Resume"],
+  recordEnd: ["结束录制", "End"],
+  recordSaving: ["正在保存…", "Saving..."],
   recordNeedFfmpeg: ["没有找到 ffmpeg，请改用 GIF 或先安装 ffmpeg", "ffmpeg was not found. Use GIF or install ffmpeg."],
   recordSpeakerHint: ["录的是正在播放的声音", "Captures what is playing"],
   undo: ["撤销", "Undo"],
@@ -83,7 +91,7 @@ const copy = {
   pinned: ["已贴图", "Pinned"],
   ocrEmpty: ["没有识别到文字", "No text recognized"],
   ocrCopied: ["已复制识别出的文字", "Copied the recognized text"],
-  hintPick: ["鼠标下的窗口会跟着亮起，单击就选中。拖动可以另框一块，按住 Shift 为正方形，滚轮切换重叠窗口，Esc 取消。", "The window under the pointer lights up. Click it to select, or drag another region. Shift makes a square, the wheel cycles overlapping windows, Esc cancels."],
+  hintPick: ["鼠标下的窗口会跟着亮起，单击就选中。拖动可以另框一块，按住 Shift 为正方形，滚轮切换重叠窗口，双击复制并关闭，Esc 取消。", "The window under the pointer lights up. Click it to select, or drag another region. Shift makes a square, the wheel cycles overlapping windows, double-click copies and closes, Esc cancels."],
   hintCopy: ["拖出区域后会直接复制到剪贴板。", "Release to copy the region to the clipboard."],
   recording: ["正在录制", "Recording"],
   stop: ["停止", "Stop"],
@@ -123,11 +131,16 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   const [themeTick, setThemeTick] = useState(0);
 
   useEffect(() => {
+    let stop: (() => void) | undefined;
     getSettings().then(setSettings).catch(() => setSettings(defaultSettings));
+    onEvent<Settings>("settings-changed", setSettings).then((unlisten) => { stop = unlisten; }).catch(() => undefined);
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const onChange = () => setThemeTick((value) => value + 1);
     media.addEventListener("change", onChange);
-    return () => media.removeEventListener("change", onChange);
+    return () => {
+      stop?.();
+      media.removeEventListener("change", onChange);
+    };
   }, []);
 
   const lang: Lang = settings.language === "zh" || settings.language === "en" ? settings.language : systemLang();

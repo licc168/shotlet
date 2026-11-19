@@ -1,0 +1,9 @@
+[package]
+name = "shotlet-types"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Serializable Shotlet DTOs. No capture, storage, or window runtime."
+
+[dependencies]
+serde.workspace = true

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Annotator } from "../editor/Annotator";
-import { aimOverlay, cancelCapture, commitHistory, copyCaptureRegion, copyPngBase64, currentCapture, ffmpegAvailable, isTauri, loadImage, ocrPngBase64, onEvent, overlayReady, pinPngBase64, pickSavePath, scrollCapture, setOverlayFollow, startRecording, writePngBase64 } from "../api";
+import { aimOverlay, cancelCapture, commitHistory, copyAnnotated, copyCaptureRegion, copyPngBase64, currentCapture, isTauri, loadFrozen, ocrPngBase64, onEvent, openRecording, overlayReady, pinPngBase64, pickSavePath, scrollCapture, setOverlayFollow, writePngBase64, type ShotImage } from "../api";
+import { screenCssSize } from "../editor/draw";
 import { useI18n } from "../i18n";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
 import type { FrozenCapture, ScreenImage, WindowInfo } from "../types";
@@ -28,12 +29,11 @@ function isCursorScreen(capture: FrozenCapture, screen: ScreenImage): boolean {
 export function Overlay() {
   const { t } = useI18n();
   const [capture, setCapture] = useState<FrozenCapture | null>(null);
-  const [image, setImage] = useState<HTMLImageElement | null>(null);
+  const [image, setImage] = useState<ShotImage | null>(null);
   const [selection, setSelection] = useState<Rect | null>(null);
   const [hover, setHover] = useState(0);
   const [draft, setDraft] = useState<Rect | null>(null);
   const [cursor, setCursor] = useState<{ x: number; y: number; hex: string } | null>(null);
-  const [ffmpeg, setFfmpeg] = useState(false);
   const [error, setError] = useState("");
   const stageRef = useRef<HTMLDivElement>(null);
   const drag = useRef<{ x: number; y: number; moved: boolean; lx: number; ly: number } | null>(null);
@@ -82,7 +82,7 @@ export function Overlay() {
       ownsFollow.current = cursorScreen;
       setArmed(cursorScreen);
       try {
-        const loaded = await loadImage(screen.path || frozen.path);
+        const loaded = await loadFrozen(screen.path || frozen.path, screen.width || frozen.width, screen.height || frozen.height);
         if (dead || seen !== generation) return;
         setImage(loaded);
         setError("");
@@ -119,8 +119,6 @@ export function Overlay() {
     currentCapture().then(apply).catch((reason: unknown) => {
       if (!dead) setError(reason instanceof Error ? reason.message : String(reason));
     });
-    if (!isTauri() && new URLSearchParams(window.location.search).get("ffmpeg") === "1") setFfmpeg(true);
-    else ffmpegAvailable().then(setFfmpeg).catch(() => setFfmpeg(false));
     return () => {
       dead = true;
       stops.forEach((stop) => stop());
@@ -212,8 +210,8 @@ export function Overlay() {
   const live = draft ?? (active ? { x: active.x, y: active.y, w: active.width, h: active.height } : null);
   const shot = image;
 
-  async function finishCopy(region: Rect) {
-    if (copying.current) return;
+  async function finishCopy(region: Rect): Promise<boolean> {
+    if (copying.current) return false;
     copying.current = true;
     const x = Math.max(0, Math.round(region.x));
     const y = Math.max(0, Math.round(region.y));
@@ -246,9 +244,11 @@ export function Overlay() {
         }
       }
       await cancelCapture();
+      return true;
     } catch (reason: unknown) {
       copying.current = false;
       setError(reason instanceof Error ? reason.message : String(reason));
+      return false;
     }
   }
 
@@ -328,7 +328,7 @@ export function Overlay() {
 
   return (
     <div
-      className={armed ? "overlay-root armed" : "overlay-root"}
+      className={["overlay-root", armed ? "armed" : "", selection || draft ? "framed" : ""].filter(Boolean).join(" ")}
       onPointerEnter={() => {
         if (drag.current || selection) return;
         aimHere();
@@ -348,7 +348,8 @@ export function Overlay() {
         commitDrag();
       }}
     >
-      <img className="frozen-screen" src={image.src} alt="" draggable={false} />
+      <FrozenShot image={image} />
+      {!armed && <div className="screen-dim" />}
       {selection ? (
         <Annotator
           image={image}
@@ -357,7 +358,6 @@ export function Overlay() {
           editableSelection
           mode="capture"
           desktop
-          ffmpeg={ffmpeg}
           onClose={() => { void cancelCapture(); }}
           onScroll={() => {
             if (scrolling.current) return;
@@ -385,12 +385,18 @@ export function Overlay() {
                 scrolling.current = false;
               });
           }}
-          onRecord={(choice) => {
-            void startRecording(screen.screenX + selection.x, screen.screenY + selection.y, selection.w, selection.h, choice).catch((reason: unknown) => {
+          onPlainCopy={(region) => finishCopy(region)}
+          onRecord={() => {
+            void openRecording(screen.screenX + selection.x, screen.screenY + selection.y, selection.w, selection.h).catch((reason: unknown) => {
               setError(reason instanceof Error ? reason.message : String(reason));
             });
           }}
           onAction={async (action, png, base, layers) => {
+            if (action === "copy" && isTauri()) {
+              await copyAnnotated(png, base, JSON.stringify(layers));
+              await cancelCapture();
+              return "";
+            }
             let ocrText = "";
             if (action === "ocr") ocrText = await ocrPngBase64(png);
             const pinAt = action === "pin"
@@ -490,7 +496,22 @@ function Shade({ box }: { box: { left: number; top: number; width: number; heigh
   );
 }
 
-function boxStyle(rect: Rect, image: HTMLImageElement, stage: HTMLDivElement | null) {
+function FrozenShot({ image }: { image: ShotImage }) {
+  const host = useRef<HTMLDivElement>(null);
+  const size = screenCssSize(image.naturalWidth, image.naturalHeight, window.devicePixelRatio);
+  useLayoutEffect(() => {
+    const node = host.current;
+    if (!node || !(image instanceof HTMLCanvasElement)) return;
+    image.className = "frozen-screen";
+    image.style.width = `${size.width}px`;
+    image.style.height = `${size.height}px`;
+    if (image.parentElement !== node) node.replaceChildren(image);
+  }, [image, size.width, size.height]);
+  if (image instanceof HTMLCanvasElement) return <div className="frozen-host" ref={host} />;
+  return <img className="frozen-screen" src={image.src} alt="" draggable={false} style={{ width: size.width, height: size.height }} />;
+}
+
+function boxStyle(rect: Rect, image: ShotImage, stage: HTMLDivElement | null) {
   if (!stage) return { left: rect.x, top: rect.y, width: rect.w, height: rect.h };
   const bounds = stage.getBoundingClientRect();
   const sx = bounds.width / image.naturalWidth;
@@ -498,12 +519,12 @@ function boxStyle(rect: Rect, image: HTMLImageElement, stage: HTMLDivElement | n
   return { left: rect.x * sx, top: rect.y * sy, width: rect.w * sx, height: rect.h * sy };
 }
 
-function eventLeft(point: { x: number }, image: HTMLImageElement, stage: HTMLDivElement | null) {
+function eventLeft(point: { x: number }, image: ShotImage, stage: HTMLDivElement | null) {
   if (!stage) return point.x;
   return (point.x / image.naturalWidth) * stage.getBoundingClientRect().width + 16;
 }
 
-function eventTop(point: { y: number }, image: HTMLImageElement, stage: HTMLDivElement | null) {
+function eventTop(point: { y: number }, image: ShotImage, stage: HTMLDivElement | null) {
   if (!stage) return point.y;
   return (point.y / image.naturalHeight) * stage.getBoundingClientRect().height + 16;
 }

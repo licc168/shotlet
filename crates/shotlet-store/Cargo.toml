@@ -1,0 +1,16 @@
+[package]
+name = "shotlet-store"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Settings and capture history on disk. No screen grabber."
+
+[dependencies]
+chrono.workspace = true
+image.workspace = true
+serde_json.workspace = true
+shotlet-platform.workspace = true
+shotlet-types.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Globalization"] }

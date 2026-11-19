@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { commitHistory, copyPngBase64, currentEditor, loadImage, ocrPngBase64, pickSavePath, pinPngBase64, updateHistory, writePngBase64 } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { commitHistory, copyFile, copyPngBase64, currentEditor, loadImage, ocrPngBase64, pickSavePath, pinPngBase64, updateHistory, writePngBase64 } from "../api";
 import { Annotator } from "../editor/Annotator";
 import { rotateLayer, type Layer } from "../editor/model";
 import { useI18n } from "../i18n";
@@ -12,6 +12,8 @@ export function Editor() {
   const [documentText, setDocumentText] = useState("[]");
   const [revision, setRevision] = useState(0);
   const [error, setError] = useState("");
+  const sourcePath = useRef("");
+  const fileBacked = useRef(true);
 
   useEffect(() => {
     const id = new URLSearchParams(location.search).get("id");
@@ -20,6 +22,8 @@ export function Editor() {
         setError(t("empty"));
         return;
       }
+      sourcePath.current = payload.path;
+      fileBacked.current = true;
       setRecordId(payload.recordId);
       setDocumentText(payload.document);
       setImage(await loadImage(payload.path));
@@ -42,7 +46,13 @@ export function Editor() {
       mode="editor"
       initialDocument={documentText}
       onClose={() => window.close()}
+      onPlainCopy={async () => {
+        if (!fileBacked.current || !sourcePath.current) return false;
+        await copyFile(sourcePath.current);
+        return true;
+      }}
       onRotate={(layers) => {
+        fileBacked.current = false;
         const canvas = document.createElement("canvas");
         canvas.width = image.naturalHeight;
         canvas.height = image.naturalWidth;
@@ -56,14 +66,17 @@ export function Editor() {
         next.onload = () => replaceImage(next, rotated);
         next.src = canvas.toDataURL("image/png");
       }}
-      onCrop={(rect) => cropImage(image, rect).then((next) => replaceImage(next, [])).catch(() => undefined)}
+      onCrop={(rect) => {
+        fileBacked.current = false;
+        cropImage(image, rect).then((next) => replaceImage(next, [])).catch(() => undefined);
+      }}
       onAction={async (action, png, base, layers) => {
         let ocrText = "";
         if (action === "ocr") ocrText = await ocrPngBase64(png);
+        if (action === "copy") await copyPngBase64(png);
         const body = { pngBase64: png, basePngBase64: base, document: JSON.stringify(layers), ocrText, width: image.naturalWidth, height: image.naturalHeight, name: "" };
         const item = recordId ? await updateHistory(recordId, body) : await commitHistory(body);
         if (!recordId) setRecordId(item.id);
-        if (action === "copy") await copyPngBase64(png);
         if (action === "save") {
           const dest = await pickSavePath(`${item.name}.png`);
           if (dest) await writePngBase64(png, dest);

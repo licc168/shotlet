@@ -1,6 +1,13 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { defaultSettings, type CommitBody, type EditorPayload, type FrozenCapture, type HistoryItem, type Settings } from "./types";
 
+/** A decoded screenshot. An image element or a canvas that already holds the captured pixels. */
+export type ShotImage = CanvasImageSource & {
+  naturalWidth: number;
+  naturalHeight: number;
+  src: string;
+};
+
 const SETTINGS_KEY = "shotlet.settings";
 const HISTORY_KEY = "shotlet.history";
 
@@ -228,6 +235,14 @@ export async function copyFile(path: string): Promise<void> {
   await call("copy_file", { path });
 }
 
+export async function copyAnnotated(png: string, base: string, document: string): Promise<void> {
+  if (!isTauri()) {
+    await copyPngBase64(png);
+    return;
+  }
+  await call("copy_annotated", { png, base, document });
+}
+
 export async function copyPngBase64(data: string): Promise<void> {
   if (!isTauri()) {
     const blob = await (await fetch(`data:image/png;base64,${data}`)).blob();
@@ -327,15 +342,15 @@ export type ScrollRequest = {
 
 export async function scrollCapture(request: ScrollRequest): Promise<void> {
   if (!isTauri()) {
-    window.alert("滚动长截图需要桌面端。框住内容后，自己拖动选区里的滚动条。");
+    window.alert("滚动长截图需要桌面端。框住内容后，在页面里滚动。");
     return;
   }
   await call("scroll_capture", { request });
 }
 
-export async function finishScroll(): Promise<void> {
+export async function finishScroll(action: "edit" | "save" | "copy"): Promise<void> {
   if (!isTauri()) return;
-  await call("scroll_finish");
+  await call("scroll_finish", { action });
 }
 
 export async function cancelScroll(): Promise<void> {
@@ -343,9 +358,9 @@ export async function cancelScroll(): Promise<void> {
   await call("scroll_cancel");
 }
 
-export async function scrollProgress(): Promise<number> {
-  if (!isTauri()) return 0;
-  return call<number>("scroll_progress");
+export async function scrollProgress(): Promise<{ height: number; reverse: boolean }> {
+  if (!isTauri()) return { height: 0, reverse: false };
+  return call("scroll_progress");
 }
 
 export async function ffmpegAvailable(): Promise<boolean> {
@@ -353,30 +368,41 @@ export async function ffmpegAvailable(): Promise<boolean> {
   return call<boolean>("ffmpeg_available");
 }
 
-export type RecordChoice = {
-  format: "gif" | "mp4";
-  audio: "none" | "mic" | "speaker";
-  cursor: boolean;
-};
+export type RecordAudio = "none" | "mic" | "speaker" | "both";
 
-export async function startRecording(x: number, y: number, width: number, height: number, choice: RecordChoice): Promise<void> {
+export async function openRecording(x: number, y: number, width: number, height: number): Promise<void> {
   if (!isTauri()) {
     window.alert("区域录制需要桌面端。");
     return;
   }
-  await call("start_recording", {
-    x,
-    y,
-    width,
-    height,
-    format: choice.format,
-    audio: choice.audio,
-    cursor: choice.cursor,
-  });
+  await call("open_recording", { x, y, width, height });
 }
 
-export async function recordingStatus(): Promise<{ running: boolean; elapsedMs: number; frames: number; message?: string }> {
-  if (!isTauri()) return { running: false, elapsedMs: 0, frames: 0, message: "" };
+export async function beginRecording(format: "gif" | "mp4", audio: RecordAudio, cursor: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await call("begin_recording", { format, audio, cursor });
+}
+
+export async function setRecordingPaused(paused: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await call("set_recording_paused", { paused });
+}
+
+export type RecordingState = {
+  running: boolean;
+  paused: boolean;
+  done: boolean;
+  ready: boolean;
+  elapsedMs: number;
+  limitMs: number;
+  width: number;
+  height: number;
+  frames: number;
+  message?: string;
+};
+
+export async function recordingStatus(): Promise<RecordingState> {
+  if (!isTauri()) return { running: false, paused: false, done: false, ready: true, elapsedMs: 0, limitMs: 3_600_000, width: 0, height: 0, frames: 0, message: "" };
   return call("recording_status");
 }
 
@@ -406,6 +432,26 @@ export async function pickDirectory(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const picked = await open({ directory: true, multiple: false });
   return typeof picked === "string" ? picked : null;
+}
+
+export async function loadFrozen(path: string, width: number, height: number): Promise<ShotImage> {
+  if (!isTauri() || !(width > 0) || !(height > 0)) return loadImage(path);
+  const bytes = await call<ArrayBuffer | Uint8Array>("preview_rgba", { path });
+  const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (raw.byteLength !== width * height * 4) return loadImage(path);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return loadImage(path);
+  const pixels = new Uint8ClampedArray(raw.byteLength);
+  pixels.set(raw);
+  ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+  const shot = canvas as HTMLCanvasElement & ShotImage;
+  shot.naturalWidth = width;
+  shot.naturalHeight = height;
+  shot.src = "";
+  return shot;
 }
 
 export function loadImage(path: string): Promise<HTMLImageElement> {

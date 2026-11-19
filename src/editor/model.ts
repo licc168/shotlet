@@ -11,7 +11,7 @@ export type Layer =
   | { id: string; type: "arrow"; x1: number; y1: number; x2: number; y2: number; color: string; thickness: number }
   | { id: string; type: "brush"; points: Point[]; color: string; thickness: number }
   | { id: string; type: "mosaic"; points: Point[]; radius: number; block: number }
-  | { id: string; type: "highlight"; x: number; y: number; w: number; h: number; ellipse: boolean }
+  | { id: string; type: "highlight"; x: number; y: number; w: number; h: number; ellipse: boolean; color?: string }
   | { id: string; type: "text"; x: number; y: number; text: string; color: string; size: number }
   | { id: string; type: "number"; x: number; y: number; n: number; color: string }
   | { id: string; type: "watermark"; text: string; color: string; size: number };

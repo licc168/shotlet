@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::util::{decode_png, err};
+use shotlet_platform::{decode_png, err, load_rgba};
 use image::RgbaImage;
 
 pub fn recognize_png_base64(data: &str) -> Result<String, String> {
@@ -107,7 +107,7 @@ fn recognize_windows(png: &[u8]) -> Result<String, String> {
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::DataWriter;
 
-    let image = crate::util::load_rgba(png)?;
+    let image = load_rgba(png)?;
     let max_side = OcrEngine::MaxImageDimension().map_err(err)?.max(1);
     let image = fit_within(image, max_side);
     let (width, height) = image.dimensions();
@@ -195,7 +195,7 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 fn recognize_macos(png: &[u8]) -> Result<String, String> {
-    let image = crate::util::load_rgba(png)?;
+    let image = load_rgba(png)?;
     let image = fit_within(image, 4096);
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {

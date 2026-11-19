@@ -1,0 +1,9 @@
+[package]
+name = "shotlet-image"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Pixel stitching for scroll capture. No screen grabber and no files."
+
+[dependencies]
+image.workspace = true

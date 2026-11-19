@@ -1,88 +1,53 @@
-use serde::Serialize;
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::capture::{self, FrozenCapture};
-use crate::history::{self, CommitRequest, HistoryItem};
-use crate::ocr;
-use crate::record;
-use crate::scroll;
-use crate::settings::{self, Settings};
-use crate::state::{AppState, EditorSession};
+use shotlet_core::capture_session::{self, FrozenCapture};
+use shotlet_core::editor::{self, EditorView};
+use shotlet_core::library::{self, CommitRequest, HistoryItem, LatestCopy};
+use shotlet_core::record_session::{self, RecordStatus};
+use shotlet_core::scroll_session::{self, ScrollRequest, ScrollStatus};
+use shotlet_core::shortcut::{self, Settings};
+use shotlet_core::state::AppState;
+
 use crate::ui;
-use crate::util::{self, err};
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditorView {
-    pub record_id: Option<String>,
-    pub path: String,
-    pub width: u32,
-    pub height: u32,
-    pub document: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordStatus {
-    pub running: bool,
-    pub elapsed_ms: u64,
-    pub frames: u32,
-    pub message: String,
+fn err(error: impl ToString) -> String {
+    error.to_string()
 }
 
 pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
     let mode = mode.to_string();
-    let state = app.state::<AppState>();
-    state.overlay_follow.store(false, Ordering::Relaxed);
-    let epoch = state.overlay_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-    drop(state);
+    let epoch = capture_session::begin(&app.state::<AppState>());
     ui::on_main_wait(&app, |app| {
         ui::conceal_overlays(app);
     })?;
     let mode_for_capture = mode.clone();
-    let mut frozen = tauri::async_runtime::spawn_blocking(move || -> Result<FrozenCapture, String> {
-        // Let the previous overlay leave the screen so it is not frozen into the shot.
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let mut frozen = capture::freeze_under_cursor()?;
-        match mode_for_capture.as_str() {
-            "copy" => frozen.mode = "copy".into(),
-            "window" => {
-                frozen.preset = capture::window_under_cursor(frozen.origin_x, frozen.origin_y, &frozen.windows);
-                frozen.mode = "edit".into();
-            }
-            _ => frozen.mode = "edit".into(),
-        }
-        Ok(frozen)
-    })
-    .await
-    .map_err(err)??;
-    let state = app.state::<AppState>();
-    if state.overlay_epoch.load(Ordering::Relaxed) != epoch {
+    let frozen = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture))
+        .await
+        .map_err(err)??;
+    if !capture_session::is_current(&app.state::<AppState>(), epoch) {
         return Ok(());
     }
-    let generation = state.overlay_generation.fetch_add(1, Ordering::Relaxed) + 1;
-    drop(state);
-    frozen.generation = generation;
-    let follow = mode != "window" || frozen.preset.is_none();
+    let mode_for_stage = mode;
     let app_for_window = app.clone();
     app.run_on_main_thread(move || {
         let state = app_for_window.state::<AppState>();
-        if state.overlay_epoch.load(Ordering::Relaxed) != epoch {
-            return;
-        }
-        if let Err(error) = state.capture.lock().map(|mut slot| *slot = Some(frozen.clone())) {
-            let _ = app_for_window.emit("capture-error", error.to_string());
-            return;
-        }
-        if let Err(error) = ui::present_overlays(&app_for_window, &frozen, generation) {
+        let staged = match capture_session::stage(&state, epoch, frozen, &mode_for_stage) {
+            Ok(Some(staged)) => staged,
+            Ok(None) => return,
+            Err(error) => {
+                let _ = app_for_window.emit("capture-error", error);
+                return;
+            }
+        };
+        if let Err(error) = ui::present_overlays(&app_for_window, &staged.frozen, staged.generation) {
             let _ = app_for_window.emit("capture-error", error);
             return;
         }
-        state.overlay_follow.store(follow, Ordering::Relaxed);
+        capture_session::arm_follow(&state, staged.follow);
     })
     .map_err(err)
 }
@@ -118,28 +83,27 @@ pub fn on_shortcut(app: &AppHandle, shortcut: &Shortcut, event: ShortcutState) {
     let Ok(settings) = ui::read_settings(app) else {
         return;
     };
-    let incoming = normalize(&shortcut.to_string());
-    let matched = |value: &str| !value.trim().is_empty() && incoming == normalize(value);
-    if matched(&settings.capture_shortcut) {
+    let incoming = shortcut::normalize(&shortcut.to_string());
+    if shortcut::same(&incoming, &settings.capture_shortcut) {
         spawn_launch(app, "edit");
-    } else if matched(&settings.capture_copy_shortcut) {
+    } else if shortcut::same(&incoming, &settings.capture_copy_shortcut) {
         spawn_launch(app, "copy");
-    } else if matched(&settings.window_shortcut) {
+    } else if shortcut::same(&incoming, &settings.window_shortcut) {
         spawn_launch(app, "window");
-    } else if matched(&settings.pin_shortcut) {
+    } else if shortcut::same(&incoming, &settings.pin_shortcut) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             if let Err(error) = pin_clipboard_now(&app).await {
                 let _ = app.emit("capture-error", error);
             }
         });
-    } else if matched(&settings.hide_pins_shortcut) {
+    } else if shortcut::same(&incoming, &settings.hide_pins_shortcut) {
         ui::toggle_pins(app);
-    } else if matched(&settings.pin_group_shortcut) {
+    } else if shortcut::same(&incoming, &settings.pin_group_shortcut) {
         ui::switch_pin_group(app);
-    } else if matched(&settings.history_shortcut) {
+    } else if shortcut::same(&incoming, &settings.history_shortcut) {
         ui::open_history(app);
-    } else if matched(&settings.copy_latest_shortcut) {
+    } else if shortcut::same(&incoming, &settings.copy_latest_shortcut) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let _ = copy_latest_now(&app).await;
@@ -147,48 +111,22 @@ pub fn on_shortcut(app: &AppHandle, shortcut: &Shortcut, event: ShortcutState) {
     }
 }
 
-fn normalize(shortcut: &str) -> String {
-    let mut modifiers = Vec::new();
-    let mut key = String::new();
-    for token in shortcut.split('+').map(str::trim).filter(|token| !token.is_empty()) {
-        match token.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" | "cmdorcontrol" | "commandorcontrol" => modifiers.push("control"),
-            "alt" | "option" => modifiers.push("alt"),
-            "shift" => modifiers.push("shift"),
-            "super" | "meta" | "win" | "command" | "cmd" | "windows" => modifiers.push("super"),
-            _ => key = token.to_ascii_lowercase(),
+pub async fn copy_latest_now(app: &AppHandle) -> Result<(), String> {
+    match library::copy_latest(&storage(app)?)? {
+        LatestCopy::Empty => {
+            let _ = app.emit("capture-error", "还没有可复制的截图");
+        }
+        LatestCopy::Copied => {
+            let _ = app.emit("capture-error", "已复制最近一张截图");
         }
     }
-    const ORDER: [&str; 4] = ["shift", "control", "alt", "super"];
-    modifiers.sort_by_key(|name| ORDER.iter().position(|item| item == name).unwrap_or(ORDER.len()));
-    modifiers.dedup();
-    if key.is_empty() {
-        modifiers.join("+")
-    } else if modifiers.is_empty() {
-        key
-    } else {
-        format!("{}+{key}", modifiers.join("+"))
-    }
-}
-
-pub async fn copy_latest_now(app: &AppHandle) -> Result<(), String> {
-    let root = storage(app)?;
-    let Some(path) = history::latest_file(&root) else {
-        let _ = app.emit("capture-error", "还没有可复制的截图");
-        return Ok(());
-    };
-    let image = util::read_png_file(std::path::Path::new(&path))?;
-    util::copy_rgba(&image)?;
-    let _ = app.emit("capture-error", "已复制最近一张截图");
     Ok(())
 }
 
 fn storage(app: &AppHandle) -> Result<PathBuf, String> {
     let data = ui::app_data_dir(app)?;
     let settings = ui::read_settings(app)?;
-    let root = settings::storage_root(&data, &settings);
-    std::fs::create_dir_all(&root).map_err(err)?;
-    Ok(root)
+    library::ensure_dir(&data, &settings)
 }
 
 pub(crate) fn shortcut_log(app: &AppHandle, message: &str) {
@@ -197,11 +135,7 @@ pub(crate) fn shortcut_log(app: &AppHandle, message: &str) {
     eprint!("shortcuts: {line}");
     if let Ok(dir) = ui::app_data_dir(app) {
         let _ = std::fs::create_dir_all(&dir);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("shotlet.log"))
-        {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("shotlet.log")) {
             use std::io::Write;
             let _ = file.write_all(line.as_bytes());
         }
@@ -233,15 +167,15 @@ pub fn apply_shortcuts(app: &AppHandle, settings: &Settings) -> Result<(), Strin
     }
     #[cfg(not(target_os = "macos"))]
     {
-    app.global_shortcut().unregister_all().map_err(err)?;
-    let failed = register_missing(app, settings);
-    if !failed.is_empty() {
-        // Another app often still holds these keys while Shotlet is restarting.
-        // Retry without dropping the shortcuts that already registered.
-        let app = app.clone();
-        std::thread::spawn(move || retry_shortcuts(app, failed));
-    }
-    Ok(())
+        app.global_shortcut().unregister_all().map_err(err)?;
+        let failed = register_missing(app, settings);
+        if !failed.is_empty() {
+            // Another app often still holds these keys while Shotlet is restarting.
+            // Retry without dropping the shortcuts that already registered.
+            let app = app.clone();
+            std::thread::spawn(move || retry_shortcuts(app, failed));
+        }
+        Ok(())
     }
 }
 
@@ -280,16 +214,7 @@ fn retry_shortcuts(app: AppHandle, mut failed: Vec<String>) {
 }
 
 pub(crate) fn shortcut_values(settings: &Settings) -> [&str; 8] {
-    [
-        settings.capture_shortcut.as_str(),
-        settings.capture_copy_shortcut.as_str(),
-        settings.window_shortcut.as_str(),
-        settings.pin_shortcut.as_str(),
-        settings.hide_pins_shortcut.as_str(),
-        settings.pin_group_shortcut.as_str(),
-        settings.history_shortcut.as_str(),
-        settings.copy_latest_shortcut.as_str(),
-    ]
+    shortcut::values(settings)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -305,7 +230,7 @@ pub async fn start_capture(app: AppHandle, mode: Option<String>) -> Result<(), S
 
 #[tauri::command]
 pub fn current_capture(state: State<AppState>) -> Result<Option<FrozenCapture>, String> {
-    Ok(state.capture.lock().map_err(err)?.clone())
+    capture_session::current(&state)
 }
 
 #[tauri::command]
@@ -330,27 +255,18 @@ pub fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 pub fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
-    let enabled = shortcut_values(&settings);
-    for shortcut in enabled {
+    for shortcut in shortcut::values(&settings) {
         if !shortcut.trim().is_empty() {
             validate_shortcut(shortcut)?;
         }
     }
-    for (index, left) in enabled.iter().enumerate() {
-        if left.trim().is_empty() {
-            continue;
-        }
-        for right in enabled.iter().skip(index + 1) {
-            if !right.trim().is_empty() && normalize(left) == normalize(right) {
-                return Err("快捷键不能重复".into());
-            }
-        }
-    }
+    shortcut::reject_duplicates(&settings)?;
     let data = ui::app_data_dir(&app)?;
-    settings::save(&data, &settings)?;
-    *app.state::<AppState>().settings.lock().map_err(err)? = settings.clone();
+    library::save_settings(&data, &settings)?;
+    shortcut::remember(&app.state::<AppState>(), settings.clone())?;
     apply_shortcuts(&app, &settings)?;
     ui::rebuild_tray_menu(&app)?;
+    let _ = app.emit("settings-changed", &settings);
     Ok(())
 }
 
@@ -364,70 +280,74 @@ fn validate_shortcut(text: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub fn list_history(app: AppHandle, query: String, filter: String) -> Result<Vec<HistoryItem>, String> {
-    Ok(history::list(&storage(&app)?, &query, &filter))
+    Ok(library::list(&storage(&app)?, &query, &filter))
 }
 
 #[tauri::command]
 pub fn commit_history(app: AppHandle, request: CommitRequest) -> Result<HistoryItem, String> {
-    history::commit(&storage(&app)?, request)
+    library::commit(&storage(&app)?, request)
 }
 
 #[tauri::command]
 pub fn update_history(app: AppHandle, id: String, request: CommitRequest) -> Result<HistoryItem, String> {
-    history::update_document(&storage(&app)?, &id, request)
+    library::update_document(&storage(&app)?, &id, request)
 }
 
 #[tauri::command]
 pub fn set_favorite(app: AppHandle, id: String, favorite: bool) -> Result<(), String> {
-    history::set_favorite(&storage(&app)?, &id, favorite)
+    library::set_favorite(&storage(&app)?, &id, favorite)
 }
 
 #[tauri::command]
 pub fn set_tags(app: AppHandle, id: String, tags: Vec<String>) -> Result<(), String> {
-    history::set_tags(&storage(&app)?, &id, tags)
+    library::set_tags(&storage(&app)?, &id, tags)
 }
 
 #[tauri::command]
 pub fn rename_capture(app: AppHandle, id: String, name: String) -> Result<(), String> {
-    history::rename(&storage(&app)?, &id, name)
+    library::rename(&storage(&app)?, &id, name)
 }
 
 #[tauri::command]
 pub fn delete_captures(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
-    history::soft_delete(&storage(&app)?, &ids)
+    library::soft_delete(&storage(&app)?, &ids)
 }
 
 #[tauri::command]
 pub fn restore_captures(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
-    history::restore(&storage(&app)?, &ids)
+    library::restore(&storage(&app)?, &ids)
 }
 
 #[tauri::command]
 pub fn purge_deleted(app: AppHandle) -> Result<(), String> {
-    history::purge(&storage(&app)?)
+    library::purge(&storage(&app)?)
 }
 
 #[tauri::command]
 pub fn export_captures(app: AppHandle, ids: Vec<String>, dest_dir: String) -> Result<u32, String> {
-    history::export(&storage(&app)?, &ids, std::path::Path::new(&dest_dir))
+    library::export(&storage(&app)?, &ids, Path::new(&dest_dir))
 }
 
 #[tauri::command]
 pub fn copy_file(path: String) -> Result<(), String> {
-    let image = util::read_png_file(std::path::Path::new(&path))?;
-    util::copy_rgba(&image)
+    library::copy_png_file(Path::new(&path))
 }
 
 #[tauri::command]
 pub fn write_png_base64(data: String, dest: String) -> Result<(), String> {
-    let image = util::load_rgba(&util::decode_png(&data)?)?;
-    util::write_png(std::path::Path::new(&dest), &image)
+    library::write_png_base64(&data, Path::new(&dest))
 }
 
 #[tauri::command]
 pub fn copy_png_base64(data: String) -> Result<(), String> {
-    let image = util::load_rgba(&util::decode_png(&data)?)?;
-    util::copy_rgba(&image)
+    library::copy_png_base64(&data)
+}
+
+#[tauri::command]
+pub fn copy_annotated(app: AppHandle, png: String, base: String, document: String) -> Result<(), String> {
+    library::copy_annotated(&storage(&app)?, &png, &base, &document)?;
+    let _ = app.emit("capture-error", "已复制截图");
+    Ok(())
 }
 
 fn round_i32(value: f64) -> i32 {
@@ -441,9 +361,9 @@ fn round_i32(value: f64) -> i32 {
 pub fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<(), String> {
     let x = round_i32(x);
     let y = round_i32(y);
-    let image = util::read_png_file(std::path::Path::new(&path))?;
-    eprintln!("pin: file {path} at {x},{y} ({}x{})", image.width(), image.height());
-    ui::open_pin(&app, path, x, y, image.width(), image.height())
+    let (width, height) = library::image_size(Path::new(&path))?;
+    eprintln!("pin: file {path} at {x},{y} ({width}x{height})");
+    ui::open_pin(&app, path, x, y, width, height)
 }
 
 #[tauri::command]
@@ -453,15 +373,10 @@ pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Res
     let x = round_i32(x);
     let y = round_i32(y);
     eprintln!("pin: png bytes={} at {x},{y}", data.len());
-    let (path, width, height) = tauri::async_runtime::spawn_blocking(move || -> Result<(std::path::PathBuf, u32, u32), String> {
-        let image = util::load_rgba(&util::decode_png(&data)?)?;
-        let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
-        util::write_png(&path, &image)?;
-        eprintln!("pin: wrote {} ({}x{})", path.display(), image.width(), image.height());
-        Ok((path, image.width(), image.height()))
-    })
-    .await
-    .map_err(err)??;
+    let (path, width, height) = tauri::async_runtime::spawn_blocking(move || library::write_pin_png(&data))
+        .await
+        .map_err(err)??;
+    eprintln!("pin: wrote {} ({width}x{height})", path.display());
     ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?;
     eprintln!("pin: window queued");
     Ok(())
@@ -469,33 +384,13 @@ pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Res
 
 #[tauri::command]
 pub fn copy_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
-    let (screens, path) = {
-        let state = app.state::<AppState>();
-        let capture = state.capture.lock().map_err(err)?;
-        let item = capture.as_ref().ok_or_else(|| "没有可复制的截图".to_string())?;
-        (item.screens.clone(), item.path.clone())
-    };
-    let cropped = if screens.is_empty() {
-        let image = util::read_png_file(std::path::Path::new(&path))?;
-        capture::crop_frozen(&image, x, y, width, height)?
-    } else {
-        capture::crop_screens(&screens, x, y, width, height)?
-    };
-    util::copy_rgba(&cropped)?;
-    history::commit_image(&storage(&app)?, &cropped, "自动复制")?;
+    library::copy_capture_region(&app.state::<AppState>(), &storage(&app)?, x, y, width, height)?;
     let _ = app.emit("capture-error", "已复制截图");
     Ok(())
 }
 
 pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
-    let image = tauri::async_runtime::spawn_blocking(util::clipboard_rgba)
-        .await
-        .map_err(err)??;
-    let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
-    let width = image.width();
-    let height = image.height();
-    util::write_png(&path, &image)?;
-    let (x, y) = capture::cursor_point().unwrap_or((120, 120));
+    let (path, x, y, width, height) = tauri::async_runtime::spawn_blocking(library::pin_clipboard).await.map_err(err)??;
     eprintln!("pin: clipboard {} at {x},{y} ({width}x{height})", path.display());
     ui::open_pin(app, path.to_string_lossy().to_string(), x, y, width, height)?;
     let _ = app.emit("capture-error", "已贴图");
@@ -504,134 +399,73 @@ pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn pin_path(state: State<AppState>, id: String) -> Result<String, String> {
-    state
-        .pins
-        .lock()
-        .map_err(err)?
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| "贴图已经失效".into())
+    library::pin_path(&state, &id)
 }
-
 
 #[tauri::command]
 pub fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
-    let path = std::path::Path::new(&path);
-    let meta = std::fs::metadata(path).map_err(err)?;
-    if !meta.is_file() {
-        return Err("找不到截图".into());
-    }
-    // Full-screen retina captures stay well under this. Reject anything else
-    // before it is copied into the webview.
-    if meta.len() > 80 * 1024 * 1024 {
+    let bytes = library::read_image_bytes(Path::new(&path))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub fn preview_rgba(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = capture_session::preview_bytes(&path)?;
+    if bytes.len() > 96 * 1024 * 1024 {
         return Err("截图太大，无法显示".into());
     }
-    let bytes = std::fs::read(path).map_err(err)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
 pub async fn ocr_png_base64(data: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let text = ocr::recognize_png_base64(&data)?;
-        if !text.is_empty() {
-            let _ = util::copy_text(&text);
-        }
-        Ok(text)
-    })
-    .await
-    .map_err(err)?
+    tauri::async_runtime::spawn_blocking(move || library::recognize_png(&data)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub fn open_editor_record(app: AppHandle, id: String) -> Result<(), String> {
-    let (path, width, height, document) = history::editor_source(&storage(&app)?, &id)?;
-    *app.state::<AppState>().editor.lock().map_err(err)? = Some(EditorSession {
-        record_id: Some(id),
-        path,
-        width,
-        height,
-        document,
-    });
+    let session = editor::from_history(&storage(&app)?, &id)?;
+    editor::store(&app.state::<AppState>(), session)?;
     ui::open_editor(&app)
 }
 
 #[tauri::command]
 pub fn current_editor(state: State<AppState>) -> Result<Option<EditorView>, String> {
-    let session = state.editor.lock().map_err(err)?;
-    Ok(session.as_ref().map(|session| EditorView {
-        record_id: session.record_id.clone(),
-        path: session.path.clone(),
-        width: session.width,
-        height: session.height,
-        document: session.document.clone(),
-    }))
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScrollRequest {
-    pub screen_x: i32,
-    pub screen_y: i32,
-    pub screen_w: u32,
-    pub screen_h: u32,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    pub image_w: u32,
-    pub image_h: u32,
-    pub point_w: u32,
-    pub point_h: u32,
+    editor::current_view(&state)
 }
 
 #[tauri::command]
-pub fn scroll_finish() {
-    scroll::request_finish();
+pub fn scroll_finish(action: String) {
+    scroll_session::finish_request(&action);
 }
 
 #[tauri::command]
 pub fn scroll_cancel() {
-    scroll::request_cancel();
+    scroll_session::cancel_request();
 }
 
 #[tauri::command]
-pub fn scroll_progress() -> u32 {
-    scroll::progress()
+pub fn scroll_progress() -> ScrollStatus {
+    scroll_session::status()
 }
 
 #[tauri::command]
 pub async fn scroll_capture(app: AppHandle, request: ScrollRequest) -> Result<EditorView, String> {
-    let x = request.x.max(0) as u32;
-    let y = request.y.max(0) as u32;
-    let width = request.width;
-    let height = request.height;
-    if width < 20 || height < 20 {
-        return Err("滚动选区太小".into());
-    }
-    scroll::begin()?;
-    let (vx, vy, vw, vh) = scroll::visual_rect(
-        request.screen_x,
-        request.screen_y,
-        x,
-        y,
-        width,
-        height,
-        request.image_w,
-        request.image_h,
-        request.point_w,
-        request.point_h,
-    );
-    let screen_x = request.screen_x;
-    let screen_y = request.screen_y;
-    let screen_w = request.screen_w;
-    let screen_h = request.screen_h;
+    let frame = scroll_session::prepare(&request)?;
+    let vx = frame.visual_x;
+    let vy = frame.visual_y;
+    let vw = frame.visual_w;
+    let vh = frame.visual_h;
+    let screen_x = frame.screen_x;
+    let screen_y = frame.screen_y;
+    let screen_w = frame.screen_w;
+    let screen_h = frame.screen_h;
     eprintln!("scroll: open chrome at {vx},{vy} {vw}x{vh} on {screen_x},{screen_y} {screen_w}x{screen_h}");
     if let Err(error) = ui::on_main_wait_for(&app, std::time::Duration::from_secs(8), move |app| {
         ui::open_scroll_chrome(app, vx, vy, vw, vh, screen_x, screen_y, screen_w, screen_h)
     }) {
         eprintln!("scroll: chrome failed: {error}");
-        scroll::end();
+        scroll_session::end();
         let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
         return Err(error);
     }
@@ -639,118 +473,114 @@ pub async fn scroll_capture(app: AppHandle, request: ScrollRequest) -> Result<Ed
         Ok(labels) => labels,
         Err(error) => {
             eprintln!("scroll: hide overlay failed: {error}");
-            scroll::end();
+            scroll_session::end();
             let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
             return Err(error);
         }
     };
     std::thread::sleep(std::time::Duration::from_millis(160));
-    let captured = tauri::async_runtime::spawn_blocking(move || scroll::capture_manual(screen_x, screen_y, x, y, width, height)).await;
-    scroll::end();
+    let captured = tauri::async_runtime::spawn_blocking(move || scroll_session::capture(frame)).await;
+    scroll_session::end();
     let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
     let result = match captured.map_err(err).and_then(|inner| inner) {
         Ok(result) => result,
         Err(error) => {
             let labels = hidden;
             let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), move |app| ui::show_overlay_labels(app, &labels));
-            if error != scroll::CANCELLED {
+            if !scroll_session::is_cancelled(&error) {
                 let _ = app.emit("capture-error", error.clone());
             }
             return Err(error);
         }
     };
-    let view = EditorView {
-        record_id: None,
-        path: result.path.clone(),
-        width: result.width,
-        height: result.height,
-        document: "[]".into(),
-    };
-    *app.state::<AppState>().editor.lock().map_err(err)? = Some(EditorSession {
-        record_id: None,
-        path: result.path,
-        width: result.width,
-        height: result.height,
-        document: "[]".into(),
-    });
+    let action = scroll_session::take_action();
+    let path = result.path.clone();
+    if action == "copy" {
+        library::copy_png_file(Path::new(&path))?;
+        ui::close_overlay(&app);
+        let _ = app.emit("capture-error", "已复制长图");
+        let (_, view) = editor::from_scroll(result);
+        return Ok(view);
+    }
+    if action == "save" {
+        if let Some(dest) = save_long_image(&app) {
+            std::fs::copy(&path, &dest).map_err(err)?;
+            ui::close_overlay(&app);
+            let _ = app.emit("capture-error", "已保存长图");
+            let (_, view) = editor::from_scroll(result);
+            return Ok(view);
+        }
+    }
+    let (session, view) = editor::from_scroll(result);
+    editor::store(&app.state::<AppState>(), session)?;
     ui::close_overlay(&app);
     ui::open_editor(&app)?;
     Ok(view)
 }
 
+fn save_long_image(app: &AppHandle) -> Option<PathBuf> {
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("PNG", &["png"])
+        .set_file_name("shotlet-scroll.png")
+        .set_title("保存长图")
+        .blocking_save_file()?;
+    file.into_path().ok()
+}
+
 #[tauri::command]
 pub fn ffmpeg_available() -> bool {
-    record::ffmpeg_available()
+    record_session::ffmpeg_available()
 }
 
 #[tauri::command(async)]
-pub fn start_recording(
-    app: AppHandle,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    format: String,
-    audio: String,
-    cursor: bool,
-) -> Result<(), String> {
-    let x = x.round() as i32;
-    let y = y.round() as i32;
-    let width = width.round().max(1.0) as u32;
-    let height = height.round().max(1.0) as u32;
-    if app.state::<AppState>().recorder.lock().map_err(err)?.is_some() {
-        return Err("已经有一段录制在进行".into());
-    }
-    if width < 8 || height < 8 {
-        return Err("录制选区太小".into());
-    }
-    if format == "mp4" && !record::ffmpeg_available() {
-        return Err("没有找到 ffmpeg，请改用 GIF 或先安装 ffmpeg".into());
-    }
-    ui::on_main_wait(&app, |app| {
+pub fn open_recording(app: AppHandle, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+    let planned = record_session::place(&app.state::<AppState>(), x, y, width, height)?;
+    match ui::on_main_wait(&app, move |app| {
         ui::hide_overlay(app);
-    })?;
-    std::thread::sleep(std::time::Duration::from_millis(120));
-    let recorder = record::start(x, y, width, height, &format, &audio, cursor)?;
-    *app.state::<AppState>().recorder.lock().map_err(err)? = Some(recorder);
-    if let Err(error) = ui::open_recorder(&app, x, y, height) {
-        if let Ok(mut slot) = app.state::<AppState>().recorder.lock() {
-            if let Some(mut recorder) = slot.take() {
-                record::cancel(&mut recorder);
-            }
+        let _ = ui::open_record_border(app, planned.x, planned.y, planned.width, planned.height);
+        ui::open_recorder(app, planned.x, planned.y, planned.height)
+    }) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) | Err(error) => {
+            record_session::clear_pending(&app.state::<AppState>());
+            ui::close_record_border(&app);
+            Err(error)
         }
-        let _ = app.emit("capture-error", error.clone());
-        return Err(error);
     }
+}
+
+#[tauri::command(async)]
+pub fn begin_recording(app: AppHandle, format: String, audio: String, cursor: bool) -> Result<(), String> {
+    let recorder = record_session::begin(&app.state::<AppState>(), &format, &audio, cursor)?;
+    record_session::store(&app.state::<AppState>(), recorder)?;
     Ok(())
 }
 
 #[tauri::command]
+pub fn set_recording_paused(state: State<AppState>, paused: bool) -> Result<(), String> {
+    record_session::set_paused(&state, paused)
+}
+
+#[tauri::command]
 pub fn recording_status(state: State<AppState>) -> Result<RecordStatus, String> {
-    let recorder = state.recorder.lock().map_err(err)?;
-    Ok(match recorder.as_ref() {
-        Some(recorder) => RecordStatus {
-            running: true,
-            elapsed_ms: recorder.elapsed_ms(),
-            frames: recorder.frame_count(),
-            message: recorder.message(),
-        },
-        None => RecordStatus { running: false, elapsed_ms: 0, frames: 0, message: String::new() },
-    })
+    record_session::status(&state)
 }
 
 #[tauri::command]
 pub async fn stop_recording(app: AppHandle) -> Result<String, String> {
-    let mut recorder = app
-        .state::<AppState>()
-        .recorder
-        .lock()
-        .map_err(err)?
-        .take()
-        .ok_or("没有正在进行的录制")?;
-    let path = tauri::async_runtime::spawn_blocking(move || record::finish(&mut recorder))
-        .await
-        .map_err(err)??;
+    let recorder = record_session::take(&app.state::<AppState>())?;
+    record_session::clear_pending(&app.state::<AppState>());
+    ui::close_record_border(&app);
+    let Some(mut recorder) = recorder else {
+        ui::close_recorder(&app);
+        return Ok(String::new());
+    };
+    let path = match tauri::async_runtime::spawn_blocking(move || record_session::finish(&mut recorder)).await.map_err(err)? {
+        Ok(path) => path,
+        Err(error) => return Err(error),
+    };
     ui::close_recorder(&app);
     let text = path.to_string_lossy().to_string();
     let _ = app.opener().open_path(text.clone(), None::<&str>);
@@ -766,18 +596,3 @@ pub fn storage_dir(app: AppHandle) -> Result<String, String> {
 pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     app.opener().open_path(path, None::<&str>).map_err(err)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::normalize;
-
-    #[test]
-    fn shortcut_normalize_ignores_modifier_order_and_case() {
-        assert_eq!(normalize("Control+F1"), normalize("control+f1"));
-        assert_eq!(normalize("Control+Shift+F1"), normalize("shift+control+F1"));
-        assert_eq!(normalize("F3"), normalize("f3"));
-        assert_eq!(normalize("Super+Shift+KeyH"), normalize("shift+super+KeyH"));
-        assert_ne!(normalize("F1"), normalize("Control+F1"));
-    }
-}
-

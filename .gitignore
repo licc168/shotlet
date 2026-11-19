@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Cargo workspace output. The Tauri crate used to keep this under src-tauri.
+/target/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

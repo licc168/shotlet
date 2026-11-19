@@ -1,57 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::util::err;
-
-fn default_capture() -> String { "F1".into() }
-fn default_capture_copy() -> String { "Control+F1".into() }
-fn default_window() -> String { "Shift+F1".into() }
-fn default_pin() -> String { "F3".into() }
-fn default_hide_pins() -> String { "Shift+F3".into() }
-fn default_pin_group() -> String { "Control+F3".into() }
-fn default_history() -> String { "Super+Shift+KeyH".into() }
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Settings {
-    pub theme: String,
-    pub language: String,
-    #[serde(default = "default_capture")]
-    pub capture_shortcut: String,
-    #[serde(default = "default_capture_copy")]
-    pub capture_copy_shortcut: String,
-    #[serde(default = "default_window")]
-    pub window_shortcut: String,
-    #[serde(default = "default_pin")]
-    pub pin_shortcut: String,
-    #[serde(default = "default_hide_pins")]
-    pub hide_pins_shortcut: String,
-    #[serde(default = "default_pin_group")]
-    pub pin_group_shortcut: String,
-    #[serde(default = "default_history")]
-    pub history_shortcut: String,
-    #[serde(default)]
-    pub copy_latest_shortcut: String,
-    pub storage_dir: String,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: "auto".into(),
-            language: "auto".into(),
-            capture_shortcut: default_capture(),
-            capture_copy_shortcut: default_capture_copy(),
-            window_shortcut: default_window(),
-            pin_shortcut: default_pin(),
-            hide_pins_shortcut: default_hide_pins(),
-            pin_group_shortcut: default_pin_group(),
-            history_shortcut: default_history(),
-            copy_latest_shortcut: String::new(),
-            storage_dir: String::new(),
-        }
-    }
-}
+pub use shotlet_types::Settings;
+use shotlet_platform::err;
+use shotlet_types::DEFAULT_CAPTURE_SHORTCUT;
 
 pub fn settings_path(app_data: &Path) -> PathBuf {
     app_data.join("settings.json")
@@ -69,7 +20,7 @@ pub fn load(app_data: &Path) -> Settings {
         return Settings::default();
     };
     if raw.get("pinShortcut").is_none() && settings.capture_shortcut == "Super+Shift+KeyA" {
-        settings.capture_shortcut = default_capture();
+        settings.capture_shortcut = DEFAULT_CAPTURE_SHORTCUT.into();
     }
     settings
 }

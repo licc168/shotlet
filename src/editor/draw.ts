@@ -7,6 +7,7 @@ export function renderScene(
   selection: Rect,
   layers: Layer[],
   viewScale: number,
+  paintBase = true,
 ) {
   const width = Math.max(1, Math.round(selection.w * viewScale));
   const height = Math.max(1, Math.round(selection.h * viewScale));
@@ -14,20 +15,67 @@ export function renderScene(
   ctx.canvas.height = height;
   ctx.setTransform(viewScale, 0, 0, viewScale, 0, 0);
   ctx.clearRect(0, 0, selection.w, selection.h);
+  // The live preview leaves the photo on the <img> under this canvas.
+  // Drawing it again resamples the selection and looks softer than that photo.
+  if (paintBase) paintPhoto(ctx, image, selection);
+  paintMarks(ctx, layers, selection);
+  const mosaics = layers.filter((layer) => layer.type === "mosaic");
+  if (mosaics.length === 0) return;
+  const snapshot = paintBase
+    ? ctx.getImageData(0, 0, width, height)
+    : sampleScene(image, selection, layers, viewScale, width, height);
+  for (const layer of mosaics) pixelate(snapshot, layer, selection, viewScale, !paintBase);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (paintBase) {
+    ctx.putImageData(snapshot, 0, 0);
+    return;
+  }
+  blitMasked(ctx, snapshot);
+}
+
+function paintPhoto(ctx: CanvasRenderingContext2D, image: CanvasImageSource, selection: Rect) {
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(image, selection.x, selection.y, selection.w, selection.h, 0, 0, selection.w, selection.h);
+}
+
+function paintMarks(ctx: CanvasRenderingContext2D, layers: Layer[], selection: Rect) {
   ctx.save();
   ctx.translate(-selection.x, -selection.y);
   for (const layer of layers) {
     if (layer.type !== "mosaic") drawLayer(ctx, layer, selection);
   }
   ctx.restore();
-  const mosaics = layers.filter((layer) => layer.type === "mosaic");
-  if (mosaics.length > 0) {
-    const snapshot = ctx.getImageData(0, 0, width, height);
-    for (const layer of mosaics) pixelate(snapshot, layer, selection, viewScale);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.putImageData(snapshot, 0, 0);
-  }
+}
+
+function sampleScene(
+  image: CanvasImageSource,
+  selection: Rect,
+  layers: Layer[],
+  viewScale: number,
+  width: number,
+  height: number,
+): ImageData {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const sample = canvas.getContext("2d", { willReadFrequently: true });
+  if (!sample) return new ImageData(width, height);
+  sample.setTransform(viewScale, 0, 0, viewScale, 0, 0);
+  paintPhoto(sample, image, selection);
+  paintMarks(sample, layers, selection);
+  return sample.getImageData(0, 0, width, height);
+}
+
+function blitMasked(ctx: CanvasRenderingContext2D, snapshot: ImageData) {
+  const canvas = document.createElement("canvas");
+  canvas.width = snapshot.width;
+  canvas.height = snapshot.height;
+  const sample = canvas.getContext("2d");
+  if (!sample) return;
+  sample.putImageData(snapshot, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(canvas, 0, 0);
 }
 
 function drawLayer(ctx: CanvasRenderingContext2D, layer: Exclude<Layer, { type: "mosaic" }>, selection: Rect) {
@@ -52,7 +100,7 @@ function drawLayer(ctx: CanvasRenderingContext2D, layer: Exclude<Layer, { type: 
       break;
     case "highlight":
       traceShape(ctx, { ...layer, type: layer.ellipse ? "ellipse" : "rect" });
-      ctx.fillStyle = "rgba(250, 204, 21, 0.38)";
+      ctx.fillStyle = highlightFill(layer.color);
       ctx.fill();
       break;
     case "text":
@@ -87,6 +135,31 @@ function drawLayer(ctx: CanvasRenderingContext2D, layer: Exclude<Layer, { type: 
       break;
   }
   ctx.restore();
+}
+
+/** CSS size that puts one captured pixel on one device pixel. */
+export function screenCssSize(pixelW: number, pixelH: number, dpr: number): { width: number; height: number } {
+  const ratio = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  return { width: pixelW / ratio, height: pixelH / ratio };
+}
+
+/** Canvas pixels per captured pixel. Stay at 1 when the screen can show the photo; never enlarge it. */
+export function previewScale(selectionW: number, selectionH: number, cssW: number, cssH: number, dpr: number): number {
+  if (!(selectionW > 0) || !(selectionH > 0)) return 1;
+  const ratio = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  if (!(cssW > 0) || !(cssH > 0)) return 1;
+  const fit = Math.min((cssW * ratio) / selectionW, (cssH * ratio) / selectionH);
+  if (!Number.isFinite(fit) || fit <= 0) return 1;
+  return Math.min(1, fit);
+}
+
+export function highlightFill(color: string | undefined): string {
+  const hex = /^#([0-9a-f]{6})$/i.exec(color ?? "");
+  const value = hex?.[1] ?? "facc15";
+  const red = Number.parseInt(value.slice(0, 2), 16);
+  const green = Number.parseInt(value.slice(2, 4), 16);
+  const blue = Number.parseInt(value.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, 0.38)`;
 }
 
 function traceShape(ctx: CanvasRenderingContext2D, layer: { type: string; x: number; y: number; w: number; h: number }) {
@@ -144,11 +217,14 @@ function drawArrow(ctx: CanvasRenderingContext2D, x1: number, y1: number, x2: nu
   ctx.fill();
 }
 
-function pixelate(snapshot: ImageData, layer: Extract<Layer, { type: "mosaic" }>, selection: Rect, viewScale: number) {
+function pixelate(snapshot: ImageData, layer: Extract<Layer, { type: "mosaic" }>, selection: Rect, viewScale: number, isolate = false) {
   const block = Math.max(2, Math.round(layer.block * viewScale));
   const pixels = snapshot.data;
   const width = snapshot.width;
   const height = snapshot.height;
+  if (isolate) {
+    for (let index = 3; index < pixels.length; index += 4) pixels[index] = 0;
+  }
   const minX = Math.max(0, Math.floor((Math.min(...layer.points.map((point) => point.x)) - layer.radius - selection.x) * viewScale));
   const minY = Math.max(0, Math.floor((Math.min(...layer.points.map((point) => point.y)) - layer.radius - selection.y) * viewScale));
   const maxX = Math.min(width, Math.ceil((Math.max(...layer.points.map((point) => point.x)) + layer.radius - selection.x) * viewScale));
@@ -183,6 +259,7 @@ function pixelate(snapshot: ImageData, layer: Extract<Layer, { type: "mosaic" }>
           pixels[offset] = r;
           pixels[offset + 1] = g;
           pixels[offset + 2] = b;
+          if (isolate) pixels[offset + 3] = 255;
         }
       }
     }

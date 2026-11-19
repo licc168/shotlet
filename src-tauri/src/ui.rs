@@ -697,8 +697,8 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
     })
 }
 
-const RECORDER_W: f64 = 360.0;
-const RECORDER_H: f64 = 112.0;
+const RECORDER_W: f64 = 400.0;
+const RECORDER_H: f64 = 248.0;
 
 fn recorder_origin(x: i32, y: i32, height: u32) -> (i32, i32) {
     let bar_w = RECORDER_W as i32;
@@ -817,7 +817,8 @@ pub fn switch_pin_group(app: &AppHandle) {
 
 const SCROLL_FRAME: &str = "scroll-frame";
 const SCROLL_HUD: &str = "scroll-hud";
-const HUD_W: f64 = 480.0;
+const RECORD_BORDER: &str = "record-border";
+const HUD_W: f64 = 560.0;
 const HUD_H: f64 = 58.0;
 const FRAME_PAD: i32 = 8;
 
@@ -937,8 +938,30 @@ pub fn open_scroll_chrome(
     open_scroll_hud(app, sel_x, sel_y, sel_w, sel_h, screen_x, screen_y, screen_w, screen_h)
 }
 
+pub fn close_record_border(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(RECORD_BORDER) {
+        let _ = window.destroy();
+    }
+}
+
+pub fn open_record_border(app: &AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    close_record_border(app);
+    let rects = capture::monitor_rects();
+    let Some(monitor) = capture::monitor_at_point(&rects, x.saturating_add(8), y.saturating_add(8)) else {
+        return Ok(());
+    };
+    let Some(place) = frame_place(x, y, width, height, monitor.x, monitor.y, monitor.width, monitor.height, FRAME_PAD) else {
+        return Ok(());
+    };
+    open_ring(app, RECORD_BORDER, "view=scroll&role=record", place)
+}
+
 fn open_scroll_frame(app: &AppHandle, place: FramePlace) -> Result<(), String> {
-    let window = WebviewWindowBuilder::new(app, SCROLL_FRAME, view_url("view=scroll&role=frame"))
+    open_ring(app, SCROLL_FRAME, "view=scroll&role=frame", place)
+}
+
+fn open_ring(app: &AppHandle, label: &str, query: &str, place: FramePlace) -> Result<(), String> {
+    let window = WebviewWindowBuilder::new(app, label, view_url(query))
         .title("Shotlet")
         .decorations(false)
         .resizable(false)

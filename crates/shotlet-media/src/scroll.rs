@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::capture::{self, capture_local};
-use crate::stitch::{append_rows, frames_stable, prepend_rows};
-use crate::util::{new_id, write_png};
+use shotlet_capture::{capture_dir, capture_local};
+use shotlet_image::{append_rows, frames_stable, prepend_rows};
+use shotlet_platform::{new_id, write_png};
 
 pub struct ScrollResult {
     pub path: String,
@@ -26,9 +26,22 @@ struct Gate {
 
 static GATE: Mutex<Option<Arc<Gate>>> = Mutex::new(None);
 static PROGRESS: AtomicU32 = AtomicU32::new(0);
+static REVERSED: AtomicBool = AtomicBool::new(false);
+static ACTION: Mutex<String> = Mutex::new(String::new());
 
 pub fn progress() -> u32 {
     PROGRESS.load(Ordering::Relaxed)
+}
+
+pub fn reversed() -> bool {
+    REVERSED.load(Ordering::Relaxed)
+}
+
+pub fn take_action() -> String {
+    ACTION
+        .lock()
+        .map(|mut slot| std::mem::replace(&mut *slot, "edit".into()))
+        .unwrap_or_else(|_| "edit".into())
 }
 
 pub fn begin() -> Result<(), String> {
@@ -37,6 +50,10 @@ pub fn begin() -> Result<(), String> {
         return Err("滚动截图还在进行".into());
     }
     PROGRESS.store(0, Ordering::Relaxed);
+    REVERSED.store(false, Ordering::Relaxed);
+    if let Ok(mut action) = ACTION.lock() {
+        *action = "edit".into();
+    }
     *slot = Some(Arc::new(Gate {
         finish: AtomicBool::new(false),
         cancel: AtomicBool::new(false),
@@ -50,7 +67,14 @@ pub fn end() {
     }
 }
 
-pub fn request_finish() {
+pub fn request_finish(action: &str) {
+    let action = match action {
+        "save" | "copy" => action.to_string(),
+        _ => "edit".to_string(),
+    };
+    if let Ok(mut slot) = ACTION.lock() {
+        *slot = action;
+    }
     if let Ok(slot) = GATE.lock() {
         if let Some(gate) = slot.as_ref() {
             gate.finish.store(true, Ordering::SeqCst);
@@ -66,7 +90,7 @@ pub fn request_cancel() {
     }
 }
 
-/// Watch the selection while the user drags its scrollbar. This does not send wheel or pointer input.
+/// Watch the selection while the page inside it scrolls. This does not send wheel or pointer input.
 pub fn capture_manual(screen_x: i32, screen_y: i32, x: u32, y: u32, width: u32, height: u32) -> Result<ScrollResult, String> {
     if width < 20 || height < 20 {
         return Err("滚动选区太小".into());
@@ -93,12 +117,13 @@ pub fn capture_manual(screen_x: i32, screen_y: i32, x: u32, y: u32, width: u32, 
             still += 1;
         } else {
             moved += 1;
+            roll.absorb(frame);
         }
+        REVERSED.store(roll.reversed(), Ordering::Relaxed);
         if !told_still && still >= 20 && moved == 0 {
             told_still = true;
             eprintln!("scroll: captured region is not changing");
         }
-        roll.absorb(frame);
     }
     eprintln!("scroll: finish height {}", roll.height());
     save_long(roll.compose())
@@ -198,6 +223,7 @@ struct Roll {
     /// 1 grows downward, -1 grows upward, 0 is not chosen yet.
     direction: i8,
     misses: u32,
+    reversed: bool,
 }
 
 impl Roll {
@@ -212,7 +238,12 @@ impl Roll {
             total,
             direction: 0,
             misses: 0,
+            reversed: false,
         }
+    }
+
+    fn reversed(&self) -> bool {
+        self.reversed
     }
 
     fn full(&self) -> bool {
@@ -235,16 +266,26 @@ impl Roll {
         if room < 2 {
             return;
         }
-        let Some((down, rows)) = manual_step(&self.previous, &frame, self.direction) else {
-            self.misses += 1;
-            if self.misses == 1 || self.misses % 15 == 0 {
-                eprintln!(
-                    "scroll: no alignment ({}) {}",
-                    self.misses,
-                    describe_shifts(&self.previous, &frame, self.direction)
-                );
+        let (down, rows) = match manual_step(&self.previous, &frame, self.direction) {
+            Align::Reverse => {
+                self.reversed = true;
+                return;
             }
-            return;
+            Align::Miss => {
+                self.misses += 1;
+                if self.misses == 1 || self.misses % 15 == 0 {
+                    eprintln!(
+                        "scroll: no alignment ({}) {}",
+                        self.misses,
+                        describe_shifts(&self.previous, &frame, self.direction)
+                    );
+                }
+                return;
+            }
+            Align::Hit(down, rows) => {
+                self.reversed = false;
+                (down, rows)
+            }
         };
         let rows = rows.min(room);
         if rows < 2 {
@@ -284,8 +325,14 @@ struct ShiftHit {
     cost: i64,
 }
 
+enum Align {
+    Hit(bool, u32),
+    Reverse,
+    Miss,
+}
+
 /// Down is true when new rows belong at the bottom.
-fn manual_step(prev: &RgbaImage, next: &RgbaImage, direction: i8) -> Option<(bool, u32)> {
+fn manual_step(prev: &RgbaImage, next: &RgbaImage, direction: i8) -> Align {
     let down = best_shift(prev, next, true);
     let up = best_shift(prev, next, false);
     let pick = match (down, up) {
@@ -294,12 +341,15 @@ fn manual_step(prev: &RgbaImage, next: &RgbaImage, direction: i8) -> Option<(boo
         (Some(down), None) => Some((true, down.shift)),
         (None, Some(up)) => Some((false, up.shift)),
         _ => None,
-    }?;
+    };
+    let Some(pick) = pick else {
+        return Align::Miss;
+    };
     // A step back lines up the other way. Ignore it instead of pasting a duplicate strip.
     match direction {
-        1 if !pick.0 => None,
-        -1 if pick.0 => None,
-        _ => Some(pick),
+        1 if !pick.0 => Align::Reverse,
+        -1 if pick.0 => Align::Reverse,
+        _ => Align::Hit(pick.0, pick.1),
     }
 }
 
@@ -426,7 +476,7 @@ fn bottom_rows(image: &RgbaImage, rows: u32) -> RgbaImage {
 }
 
 fn save_long(image: RgbaImage) -> Result<ScrollResult, String> {
-    let path = capture::capture_dir().join(format!("scroll-{}.png", new_id()));
+    let path = capture_dir().join(format!("scroll-{}.png", new_id()));
     write_png(&path, &image)?;
     Ok(ScrollResult {
         path: path.to_string_lossy().to_string(),
@@ -474,6 +524,7 @@ mod tests {
         assert_eq!(longer.height(), 70);
         assert_eq!(longer.get_pixel(4, 69), full.get_pixel(4, 69));
         roll.absorb(view(&full, 0, 40));
+        assert!(roll.reversed());
         assert_eq!(roll.compose().height(), 70);
     }
 

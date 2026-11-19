@@ -1,51 +1,32 @@
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
-use crate::util::{decode_png, err, load_rgba, new_id, write_png};
+pub use shotlet_types::{CommitRequest, HistoryItem, Record};
+use shotlet_platform::{decode_png, err, load_rgba, new_id};
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Record {
-    pub id: String,
-    pub created_at: i64,
-    pub name: String,
-    pub tags: Vec<String>,
-    pub favorite: bool,
-    pub width: u32,
-    pub height: u32,
-    pub ocr_text: String,
-    pub file: String,
-    pub base_file: String,
-    pub document: String,
-    #[serde(default)]
-    pub deleted_at: Option<i64>,
+fn index_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HistoryItem {
-    pub id: String,
-    pub created_at: i64,
-    pub name: String,
-    pub tags: Vec<String>,
-    pub favorite: bool,
-    pub width: u32,
-    pub height: u32,
-    pub ocr_text: String,
-    pub file: String,
-    pub deleted: bool,
+fn with_index<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _guard = index_gate().lock().map_err(|error| error.to_string())?;
+    body()
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitRequest {
-    pub png_base64: String,
-    pub base_png_base64: String,
-    pub document: String,
-    pub ocr_text: String,
-    pub width: u32,
-    pub height: u32,
-    pub name: String,
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::write(path, bytes).map_err(err)
+}
+
+fn png_payload(data: &str) -> Result<Vec<u8>, String> {
+    let bytes = decode_png(data)?;
+    if bytes.starts_with(b"\x89PNG") {
+        return Ok(bytes);
+    }
+    shotlet_platform::encode_png_fast(&load_rgba(&bytes)?)
 }
 
 fn index_path(root: &Path) -> PathBuf {
@@ -112,92 +93,77 @@ fn to_item(record: Record) -> HistoryItem {
 }
 
 pub fn commit(root: &Path, request: CommitRequest) -> Result<HistoryItem, String> {
-    let id = new_id();
-    let images = root.join("images");
-    let docs = root.join("docs");
-    std::fs::create_dir_all(&images).map_err(err)?;
-    std::fs::create_dir_all(&docs).map_err(err)?;
-    let file = images.join(format!("{id}.png"));
-    let base_file = images.join(format!("{id}.base.png"));
-    let doc_file = docs.join(format!("{id}.json"));
-    write_png(&file, &load_rgba(&decode_png(&request.png_base64)?)?)?;
-    write_png(&base_file, &load_rgba(&decode_png(&request.base_png_base64)?)?)?;
-    std::fs::write(&doc_file, &request.document).map_err(err)?;
-    let name = if request.name.trim().is_empty() {
-        format!("截图 {id}")
-    } else {
-        request.name
-    };
-    let record = Record {
-        id,
-        created_at: chrono::Utc::now().timestamp_millis(),
-        name,
-        tags: Vec::new(),
-        favorite: false,
-        width: request.width,
-        height: request.height,
-        ocr_text: request.ocr_text,
-        file: file.to_string_lossy().to_string(),
-        base_file: base_file.to_string_lossy().to_string(),
-        document: doc_file.to_string_lossy().to_string(),
-        deleted_at: None,
-    };
-    let mut records = load_all(root);
-    records.insert(0, record.clone());
-    store_all(root, &records)?;
-    Ok(to_item(record))
+    let png = png_payload(&request.png_base64)?;
+    let base = png_payload(&request.base_png_base64)?;
+    commit_bytes(root, &png, &base, &request.document, request.width, request.height, &request.name, &request.ocr_text)
 }
 
 pub fn commit_image(root: &Path, image: &image::RgbaImage, name: &str) -> Result<HistoryItem, String> {
-    let id = new_id();
-    let images = root.join("images");
-    let docs = root.join("docs");
-    std::fs::create_dir_all(&images).map_err(err)?;
-    std::fs::create_dir_all(&docs).map_err(err)?;
-    let file = images.join(format!("{id}.png"));
-    let base_file = images.join(format!("{id}.base.png"));
-    let doc_file = docs.join(format!("{id}.json"));
-    write_png(&file, image)?;
-    write_png(&base_file, image)?;
-    std::fs::write(&doc_file, "[]").map_err(err)?;
-    let label = if name.trim().is_empty() {
-        format!("截图 {id}")
-    } else {
-        name.to_string()
-    };
-    let record = Record {
-        id,
-        created_at: chrono::Utc::now().timestamp_millis(),
-        name: label,
-        tags: Vec::new(),
-        favorite: false,
-        width: image.width(),
-        height: image.height(),
-        ocr_text: String::new(),
-        file: file.to_string_lossy().to_string(),
-        base_file: base_file.to_string_lossy().to_string(),
-        document: doc_file.to_string_lossy().to_string(),
-        deleted_at: None,
-    };
-    let mut records = load_all(root);
-    records.insert(0, record.clone());
-    store_all(root, &records)?;
-    Ok(to_item(record))
+    let png = shotlet_platform::encode_png_fast(image)?;
+    commit_bytes(root, &png, &png, "[]", image.width(), image.height(), name, "")
+}
+
+pub fn commit_bytes(
+    root: &Path,
+    png: &[u8],
+    base: &[u8],
+    document: &str,
+    width: u32,
+    height: u32,
+    name: &str,
+    ocr_text: &str,
+) -> Result<HistoryItem, String> {
+    with_index(|| {
+        let id = new_id();
+        let images = root.join("images");
+        let docs = root.join("docs");
+        let file = images.join(format!("{id}.png"));
+        let base_file = images.join(format!("{id}.base.png"));
+        let doc_file = docs.join(format!("{id}.json"));
+        write_bytes(&file, png)?;
+        write_bytes(&base_file, base)?;
+        write_bytes(&doc_file, document.as_bytes())?;
+        let label = if name.trim().is_empty() { format!("截图 {id}") } else { name.to_string() };
+        let record = Record {
+            id,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            name: label,
+            tags: Vec::new(),
+            favorite: false,
+            width,
+            height,
+            ocr_text: ocr_text.to_string(),
+            file: file.to_string_lossy().to_string(),
+            base_file: base_file.to_string_lossy().to_string(),
+            document: doc_file.to_string_lossy().to_string(),
+            deleted_at: None,
+        };
+        let mut records = load_all(root);
+        records.insert(0, record.clone());
+        store_all(root, &records)?;
+        Ok(to_item(record))
+    })
 }
 
 pub fn update_document(root: &Path, id: &str, request: CommitRequest) -> Result<HistoryItem, String> {
+    let png = png_payload(&request.png_base64)?;
+    let base = png_payload(&request.base_png_base64)?;
+    with_index(|| update_locked(root, id, &request, &png, &base))
+}
+
+fn update_locked(root: &Path, id: &str, request: &CommitRequest, png: &[u8], base: &[u8]) -> Result<HistoryItem, String> {
     let mut records = load_all(root);
     let Some(record) = records.iter_mut().find(|record| record.id == id) else {
         return Err("找不到这条历史记录".into());
     };
-    write_png(Path::new(&record.file), &load_rgba(&decode_png(&request.png_base64)?)?)?;
-    write_png(Path::new(&record.base_file), &load_rgba(&decode_png(&request.base_png_base64)?)?)?;
-    std::fs::write(&record.document, &request.document).map_err(err)?;
+    write_bytes(Path::new(&record.file), png)?;
+    write_bytes(Path::new(&record.base_file), base)?;
+    write_bytes(Path::new(&record.document), request.document.as_bytes())?;
     record.width = request.width;
     record.height = request.height;
-    record.ocr_text = request.ocr_text;
+    record.ocr_text = request.ocr_text.clone();
     if !request.name.trim().is_empty() {
-        record.name = request.name;
+        record.name = request.name.clone();
     }
     let item = to_item(record.clone());
     store_all(root, &records)?;
@@ -221,6 +187,13 @@ pub fn latest_file(root: &Path) -> Option<String> {
 }
 
 fn mutate<F>(root: &Path, ids: &[String], change: F) -> Result<(), String>
+where
+    F: Fn(&mut Record),
+{
+    with_index(|| mutate_locked(root, ids, change))
+}
+
+fn mutate_locked<F>(root: &Path, ids: &[String], change: F) -> Result<(), String>
 where
     F: Fn(&mut Record),
 {
@@ -255,6 +228,10 @@ pub fn restore(root: &Path, ids: &[String]) -> Result<(), String> {
 }
 
 pub fn purge(root: &Path) -> Result<(), String> {
+    with_index(|| purge_locked(root))
+}
+
+fn purge_locked(root: &Path) -> Result<(), String> {
     let records = load_all(root);
     let (gone, kept): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| record.deleted_at.is_some());
     for record in gone {

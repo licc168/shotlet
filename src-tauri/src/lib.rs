@@ -1,19 +1,9 @@
-mod capture;
+pub use shotlet_core::{capture, history, ocr, record, scroll, settings, state, util};
+
 #[cfg(target_os = "macos")]
 mod hotkey_mac;
 mod commands;
-mod history;
-mod ocr;
-mod record;
-mod record_audio;
-mod record_cursor;
-mod scroll;
-mod settings;
-mod state;
-mod stitch;
 mod ui;
-mod util;
-mod windows_list;
 
 use tauri::{Manager, RunEvent, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
@@ -61,10 +51,12 @@ pub fn run() {
             commands::copy_file,
             commands::write_png_base64,
             commands::copy_png_base64,
+            commands::copy_annotated,
             commands::pin_file,
             commands::pin_png_base64,
             commands::pin_path,
             commands::read_image_bytes,
+            commands::preview_rgba,
             commands::ocr_png_base64,
             commands::open_editor_record,
             commands::current_editor,
@@ -73,7 +65,9 @@ pub fn run() {
             commands::scroll_cancel,
             commands::scroll_progress,
             commands::ffmpeg_available,
-            commands::start_recording,
+            commands::open_recording,
+            commands::begin_recording,
+            commands::set_recording_paused,
             commands::recording_status,
             commands::stop_recording,
             commands::storage_dir,
@@ -89,8 +83,7 @@ pub fn run() {
             if let Err(error) = ui::install_tray(app.handle()) {
                 eprintln!("tray: {error}");
             }
-            #[cfg(target_os = "macos")]
-            capture::prepare_capture_access();
+            shotlet_core::capture_session::prepare_access();
             commands::shortcut_log(app.handle(), "setup complete");
             if let Err(error) = ui::prepare_overlay(app.handle()) {
                 eprintln!("overlay: {error}");

@@ -1,15 +1,4 @@
-use serde::Serialize;
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WindowInfo {
-    pub title: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-    pub z: u32,
-}
+use shotlet_types::WindowInfo;
 
 pub fn list_windows(origin_x: i32, origin_y: i32, desktop_w: i32, desktop_h: i32) -> Vec<WindowInfo> {
     #[cfg(windows)]

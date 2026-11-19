@@ -1,3 +1,4 @@
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::util::err;
+use shotlet_platform::err;
 
 pub struct AudioCapture {
     stop: Arc<AtomicBool>,
@@ -14,7 +15,7 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    pub fn start(kind: &str, wav: PathBuf) -> Result<Self, String> {
+    pub fn start(kind: &str, wav: PathBuf, pause: Arc<AtomicBool>) -> Result<Self, String> {
         if kind != "mic" && kind != "speaker" {
             return Err("未知的声音来源".into());
         }
@@ -24,7 +25,7 @@ impl AudioCapture {
         let kind_thread = kind.clone();
         let wav_thread = wav.clone();
         let (tx, rx) = mpsc::channel();
-        let thread = thread::spawn(move || capture_loop(&kind_thread, &wav_thread, &stop_thread, &tx));
+        let thread = thread::spawn(move || capture_loop(&kind_thread, &wav_thread, &stop_thread, &pause, &tx));
         match rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self { stop, thread: Some(thread), wav }),
             Ok(Err(error)) => {
@@ -55,14 +56,14 @@ fn kind_error(kind: &str, detail: &str) -> String {
     format!("{name}打开失败：{detail}")
 }
 
-fn capture_loop(kind: &str, wav: &Path, stop: &AtomicBool, ready: &mpsc::Sender<Result<(), String>>) -> Result<(), String> {
+fn capture_loop(kind: &str, wav: &Path, stop: &AtomicBool, pause: &AtomicBool, ready: &mpsc::Sender<Result<(), String>>) -> Result<(), String> {
     #[cfg(windows)]
     {
-        windows_capture(kind, wav, stop, ready)
+        windows_capture(kind, wav, stop, pause, ready)
     }
     #[cfg(not(windows))]
     {
-        let _ = (wav, stop);
+        let _ = (wav, stop, pause);
         let error = kind_error(kind, "当前系统不能录制声音");
         let _ = ready.send(Err(error.clone()));
         Err(error)
@@ -70,7 +71,7 @@ fn capture_loop(kind: &str, wav: &Path, stop: &AtomicBool, ready: &mpsc::Sender<
 }
 
 #[cfg(windows)]
-fn windows_capture(kind: &str, wav: &Path, stop: &AtomicBool, ready: &mpsc::Sender<Result<(), String>>) -> Result<(), String> {
+fn windows_capture(kind: &str, wav: &Path, stop: &AtomicBool, pause: &AtomicBool, ready: &mpsc::Sender<Result<(), String>>) -> Result<(), String> {
     let com = match ComGuard::enter() {
         Ok(guard) => guard,
         Err(error) => {
@@ -96,12 +97,7 @@ fn windows_capture(kind: &str, wav: &Path, stop: &AtomicBool, ready: &mpsc::Send
         return Err(error);
     }
     let _ = ready.send(Ok(()));
-    let recorded = opened.pump(stop);
-    let result = match recorded {
-        Ok(pcm) if pcm.is_empty() => Err("没有采到声音".into()),
-        Ok(pcm) => write_wav(wav, opened.channels, opened.rate, opened.bits, opened.tag, &pcm),
-        Err(error) => Err(error),
-    };
+    let result = opened.pump(wav, stop, pause);
     drop(opened);
     drop(com);
     result
@@ -150,17 +146,20 @@ impl Session {
         unsafe { self.client.Start().map_err(err) }
     }
 
-    fn pump(&self, stop: &AtomicBool) -> Result<Vec<u8>, String> {
-        let mut pcm = Vec::new();
+    fn pump(&self, path: &Path, stop: &AtomicBool, pause: &AtomicBool) -> Result<(), String> {
+        let mut file = begin_wav(path, self.channels, self.rate, self.bits, self.tag)?;
+        let mut data_len = 0u64;
         let started = std::time::Instant::now();
-        self.read(stop, &mut pcm, started)?;
-        Ok(pcm)
+        self.read(stop, pause, &mut file, &mut data_len, started)?;
+        if data_len == 0 {
+            return Err("没有采到声音".into());
+        }
+        finish_wav(&mut file, data_len as u32)
     }
 
-    fn read(&self, stop: &AtomicBool, pcm: &mut Vec<u8>, started: std::time::Instant) -> Result<(), String> {
+    fn read(&self, stop: &AtomicBool, pause: &AtomicBool, file: &mut std::fs::File, data_len: &mut u64, started: std::time::Instant) -> Result<(), String> {
         use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_SILENT;
-        const MAX_BYTES: usize = 32 * 1024 * 1024;
-        while !stop.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(20) && pcm.len() < MAX_BYTES {
+        while !stop.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(6 * 60 * 60) {
             let packet = unsafe { self.capture.GetNextPacketSize().map_err(err)? };
             if packet == 0 {
                 thread::sleep(Duration::from_millis(10));
@@ -171,13 +170,15 @@ impl Session {
             let mut flags = 0u32;
             unsafe { self.capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None).map_err(err)? };
             let nbytes = frames as usize * self.align as usize;
-            if nbytes > 0 && pcm.len() + nbytes <= MAX_BYTES {
+            let room = (u32::MAX as u64).saturating_sub(*data_len);
+            if !pause.load(Ordering::Relaxed) && nbytes > 0 && nbytes as u64 <= room {
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
-                    pcm.resize(pcm.len() + nbytes, 0);
+                    file.write_all(&vec![0u8; nbytes]).map_err(err)?;
                 } else {
                     let slice = unsafe { std::slice::from_raw_parts(data, nbytes) };
-                    pcm.extend_from_slice(slice);
+                    file.write_all(slice).map_err(err)?;
                 }
+                *data_len += nbytes as u64;
             }
             unsafe { self.capture.ReleaseBuffer(frames).map_err(err)? };
         }
@@ -282,16 +283,26 @@ fn simple_tag(raw: &[u8], tag: u16, pcm: &windows::core::GUID, float_pcm: &windo
     Err("不支持的音频格式".into())
 }
 
-pub fn write_wav(path: &Path, channels: u16, rate: u32, bits: u16, tag: u16, pcm: &[u8]) -> Result<(), String> {
+fn begin_wav(path: &Path, channels: u16, rate: u32, bits: u16, tag: u16) -> Result<std::fs::File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(err)?;
     }
+    let mut file = std::fs::File::create(path).map_err(err)?;
+    file.write_all(&wav_header(channels, rate, bits, tag, 0)).map_err(err)?;
+    Ok(file)
+}
+
+fn finish_wav(file: &mut std::fs::File, data_len: u32) -> Result<(), String> {
+    file.seek(SeekFrom::Start(4)).map_err(err)?;
+    file.write_all(&(36 + data_len).to_le_bytes()).map_err(err)?;
+    file.seek(SeekFrom::Start(40)).map_err(err)?;
+    file.write_all(&data_len.to_le_bytes()).map_err(err)?;
+    file.flush().map_err(err)
+}
+
+fn wav_header(channels: u16, rate: u32, bits: u16, tag: u16, data_len: u32) -> Vec<u8> {
     let block = channels as u32 * bits as u32 / 8;
-    if block == 0 {
-        return Err("音频帧长度无效".into());
-    }
-    let average = rate * block;
-    let data_len = pcm.len() as u32;
+    let average = rate.saturating_mul(block);
     let mut header = Vec::with_capacity(44);
     header.extend_from_slice(b"RIFF");
     header.extend_from_slice(&(36 + data_len).to_le_bytes());
@@ -305,11 +316,18 @@ pub fn write_wav(path: &Path, channels: u16, rate: u32, bits: u16, tag: u16, pcm
     header.extend_from_slice(&bits.to_le_bytes());
     header.extend_from_slice(b"data");
     header.extend_from_slice(&data_len.to_le_bytes());
-    let mut file = std::fs::File::create(path).map_err(err)?;
-    use std::io::Write;
-    file.write_all(&header).map_err(err)?;
+    header
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn write_wav(path: &Path, channels: u16, rate: u32, bits: u16, tag: u16, pcm: &[u8]) -> Result<(), String> {
+    let block = channels as u32 * bits as u32 / 8;
+    if block == 0 {
+        return Err("音频帧长度无效".into());
+    }
+    let mut file = begin_wav(path, channels, rate, bits, tag)?;
     file.write_all(pcm).map_err(err)?;
-    Ok(())
+    finish_wav(&mut file, pcm.len() as u32)
 }
 
 #[cfg(test)]
@@ -339,7 +357,8 @@ mod tests {
         for kind in ["mic", "speaker"] {
             let path: PathBuf = dir.join(format!("shotlet-audio-{kind}-{}.wav", std::process::id()));
             let _ = std::fs::remove_file(&path);
-            let capture = super::AudioCapture::start(kind, path.clone()).unwrap_or_else(|error| panic!("{kind}: {error}"));
+            let capture = super::AudioCapture::start(kind, path.clone(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .unwrap_or_else(|error| panic!("{kind}: {error}"));
             std::thread::sleep(std::time::Duration::from_millis(400));
             let written = capture.finish().unwrap_or_else(|error| panic!("{kind}: {error}"));
             let bytes = std::fs::read(&written).unwrap_or_else(|error| panic!("{kind}: {error}"));

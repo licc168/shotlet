@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { isDoubleClick } from "../lib/pin";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
 import { useI18n } from "../i18n";
-import { renderPng, renderScene } from "./draw";
+import type { ShotImage } from "../api";
+import { previewScale, renderPng, renderScene } from "./draw";
 import { appendStrokePoint, COLORS, hitTest, layerBounds, MAX_FONT, MIN_FONT, moveLayer, parseLayers, resizeBox, resizeTextLayer, uid, type Layer } from "./model";
 
 type Tool = "select" | "rect" | "ellipse" | "arrow" | "brush" | "mosaic" | "highlight" | "text" | "number" | "watermark";
@@ -9,30 +11,32 @@ type TextDraft = { id?: string; x: number; y: number; value: string };
 type Action = "copy" | "save" | "pin" | "ocr";
 
 type Props = {
-  image: HTMLImageElement;
+  image: ShotImage;
   selection: Rect;
   onSelectionChange?: (rect: Rect) => void;
   editableSelection?: boolean;
   mode: "capture" | "editor";
   initialDocument?: string;
   desktop?: boolean;
-  ffmpeg?: boolean;
   onClose: () => void;
   onAction: (action: Action, png: string, base: string, layers: Layer[]) => Promise<string | void>;
+  onPlainCopy?: (selection: Rect) => Promise<boolean>;
   onScroll?: () => void;
-  onRecord?: (choice: { format: "gif" | "mp4"; audio: "none" | "mic" | "speaker"; cursor: boolean }) => void;
+  onRecord?: () => void;
   onRotate?: (layers: Layer[]) => void;
   onCrop?: (rect: Rect) => void;
 };
 
 const TOOLS: Tool[] = ["rect", "ellipse", "arrow", "brush", "mosaic", "highlight", "text", "number", "watermark", "select"];
+const CAPTURE_DOUBLE_CLICK_MS = 500;
+const CAPTURE_DOUBLE_CLICK_DIST = 48;
+const NEW_SELECTION_SLOP = 6;
 
 export function Annotator(props: Props) {
   const { t } = useI18n();
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
   const [frame, setFrame] = useState({ w: 0, h: 0 });
   const [barSize, setBarSize] = useState({ w: 680, h: 44 });
   const [tool, setTool] = useState<Tool>("select");
@@ -54,11 +58,6 @@ export function Annotator(props: Props) {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
   const [ocrText, setOcrText] = useState("");
-  const [format, setFormat] = useState<"gif" | "mp4">("gif");
-  const [audio, setAudio] = useState<"none" | "mic" | "speaker">("none");
-  const [showCursor, setShowCursor] = useState(true);
-  const [recordOpen, setRecordOpen] = useState(false);
-  const [panelSize, setPanelSize] = useState({ w: 260, h: 168 });
   const [cropping, setCropping] = useState(false);
   const [crop, setCrop] = useState<Rect | null>(null);
   const drag = useRef<{ kind: string; id?: string; handle?: string; start: { x: number; y: number }; last: { x: number; y: number }; origin: Layer | null; box: Rect | null } | null>(null);
@@ -71,6 +70,10 @@ export function Annotator(props: Props) {
   const caretRef = useRef({ start: 0, end: 0 });
   const keepTextFocus = useRef(false);
   const fontAtDown = useRef<number | null>(null);
+  const watermarkAtFocus = useRef<string | null>(null);
+  const lastPointerDown = useRef<{ time: number; x: number; y: number } | null>(null);
+  const framedSelection = useRef(props.selection);
+  if (props.selection.w >= 4 && props.selection.h >= 4) framedSelection.current = props.selection;
   layersRef.current = layers;
   selectedRef.current = selected;
   fontSizeRef.current = fontSize;
@@ -91,27 +94,33 @@ export function Annotator(props: Props) {
       setFrame((prev) => (prev.w === rect.width && prev.h === rect.height ? prev : { w: rect.width, h: rect.height }));
       const bar = barRef.current;
       if (bar) setBarSize((prev) => (prev.w === bar.offsetWidth && prev.h === bar.offsetHeight ? prev : { w: bar.offsetWidth, h: bar.offsetHeight }));
-      const panel = panelRef.current;
-      if (panel) setPanelSize((prev) => (prev.w === panel.offsetWidth && prev.h === panel.offsetHeight ? prev : { w: panel.offsetWidth, h: panel.offsetHeight }));
     };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(stage);
-    if (panelRef.current) observer.observe(panelRef.current);
     return () => observer.disconnect();
-  }, [tool, props.ffmpeg, props.mode, recordOpen, format, audio]);
+  }, [tool, props.mode]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
-    const viewScale = Math.min(1, 1400 / Math.max(props.selection.w, 1));
+    if (shown.length === 0) {
+      canvas.width = 1;
+      canvas.height = 1;
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const viewScale = previewScale(props.selection.w, props.selection.h, rect.width, rect.height, window.devicePixelRatio);
     try {
-      renderScene(ctx, props.image, props.selection, shown, viewScale);
+      renderScene(ctx, props.image, props.selection, shown, viewScale, false);
+      // WebView2 drops a canvas update that happens after paint, until the next
+      // mouse move. Drawing before paint, then reading a pixel, keeps this frame.
+      ctx.getImageData(0, 0, 1, 1);
     } catch (error) {
       console.error(error);
     }
-  }, [props.image, props.selection, shown]);
+  }, [props.image, props.selection, shown, frame.w, frame.h]);
 
   function push(next: Layer[]) {
     const previous = layersRef.current;
@@ -133,8 +142,53 @@ export function Annotator(props: Props) {
     colorRef.current = next;
     setColor(next);
     if (textDraftRef.current) return;
-    const updated = layersRef.current.map((item) => item.type === "text" && item.id === selectedRef.current && item.color !== next ? { ...item, color: next } : item);
+    const updated = layersRef.current.map((item) => {
+      if (tool === "watermark" && item.type === "watermark" && item.color !== next) return { ...item, color: next };
+      if (item.type === "text" && item.id === selectedRef.current && item.color !== next) return { ...item, color: next };
+      if (item.type === "highlight" && item.id === selectedRef.current && item.color !== next) return { ...item, color: next };
+      return item;
+    });
     if (updated.some((item, index) => item !== layersRef.current[index])) push(updated);
+  }
+
+  function setHighlightEllipse(ellipse: boolean) {
+    setEllipseHighlight(ellipse);
+    const id = selectedRef.current;
+    const updated = layersRef.current.map((item) => {
+      if (item.type !== "highlight" || item.id !== id || item.ellipse === ellipse) return item;
+      return { ...item, ellipse };
+    });
+    if (updated.some((item, index) => item !== layersRef.current[index])) push(updated);
+  }
+
+  function patchWatermarkText(text: string) {
+    setLayers((items) => {
+      let changed = false;
+      const updated = items.map((item) => {
+        if (item.type !== "watermark" || item.text === text) return item;
+        changed = true;
+        return { ...item, text };
+      });
+      if (!changed) return items;
+      layersRef.current = updated;
+      return updated;
+    });
+  }
+
+  function rememberWatermarkText() {
+    const mark = layersRef.current.find((item) => item.type === "watermark");
+    watermarkAtFocus.current = mark?.type === "watermark" ? mark.text : null;
+  }
+
+  function commitWatermarkText() {
+    const previous = watermarkAtFocus.current;
+    watermarkAtFocus.current = null;
+    if (previous == null) return;
+    const mark = layersRef.current.find((item) => item.type === "watermark");
+    if (!mark || mark.type !== "watermark" || mark.text === previous) return;
+    const reverted = layersRef.current.map((item) => item.type === "watermark" ? { ...item, text: previous } : item);
+    setUndo((stack) => [...stack.slice(-40), reverted]);
+    setRedo([]);
   }
 
   function changeFontSize(next: number) {
@@ -237,6 +291,20 @@ export function Annotator(props: Props) {
 
   function onPointerDown(event: React.PointerEvent) {
     if (textDraft || busy) return;
+    if (event.button === 0 && props.mode === "capture") {
+      const stamp = { time: event.timeStamp, x: event.clientX, y: event.clientY };
+      const repeated = event.detail >= 2 || isDoubleClick(lastPointerDown.current, stamp, CAPTURE_DOUBLE_CLICK_MS, CAPTURE_DOUBLE_CLICK_DIST);
+      lastPointerDown.current = stamp;
+      const target = event.target;
+      const onControl = target instanceof Element && Boolean(target.closest("textarea, input, button, select, .toolbar, .subbar, .record-panel"));
+      if (repeated && !onControl) {
+        drag.current = null;
+        const framed = framedSelection.current;
+        const selection = framed.w >= 4 && framed.h >= 4 ? framed : props.selection;
+        void run("copy", selection);
+        return;
+      }
+    }
     const point = toImage(event);
     if (cropping) {
       drag.current = { kind: "crop", start: point, last: point, origin: null, box: null };
@@ -265,7 +333,6 @@ export function Annotator(props: Props) {
       }
       if (props.editableSelection && props.onSelectionChange && !contains(props.selection, point.x, point.y)) {
         drag.current = { kind: "new-selection", start: point, last: point, origin: null, box: props.selection };
-        props.onSelectionChange(normalize(point.x, point.y, point.x, point.y));
         return;
       }
       if (props.editableSelection && contains(props.selection, point.x, point.y)) {
@@ -376,6 +443,7 @@ export function Annotator(props: Props) {
       return;
     }
     if (current.kind === "new-selection" && props.onSelectionChange) {
+      if (Math.hypot(point.x - current.start.x, point.y - current.start.y) * scale() < NEW_SELECTION_SLOP) return;
       const next = clampRect(
         event.shiftKey ? square(current.start.x, current.start.y, point.x, point.y) : normalize(current.start.x, current.start.y, point.x, point.y),
         { x: 0, y: 0, w: props.image.naturalWidth, h: props.image.naturalHeight },
@@ -413,7 +481,12 @@ export function Annotator(props: Props) {
         const box = layerBounds(finished);
         if (box.w > 2 || box.h > 2 || finished.type === "brush" || finished.type === "mosaic") {
           push([...layers, finished]);
-          setSelected(finished.id);
+          choose(finished.id);
+          if (finished.type === "highlight") {
+            colorRef.current = finished.color ?? colorRef.current;
+            setColor(finished.color ?? colorRef.current);
+            setEllipseHighlight(finished.ellipse);
+          }
         }
         setDraft(null);
       }
@@ -525,13 +598,20 @@ export function Annotator(props: Props) {
     commitText();
   }
 
-  async function run(action: Action) {
+  async function run(action: Action, selection = props.selection) {
     setBusy(true);
     setNote("");
     try {
-      const png = await renderPng(props.image, props.selection, layers, true);
-      const base = await renderPng(props.image, props.selection, [], false);
-      const text = await props.onAction(action, png, base, layers);
+      commitText();
+      const marks = layersRef.current;
+      if (action === "copy" && marks.length === 0 && props.onPlainCopy) {
+        const handled = await props.onPlainCopy(selection);
+        if (handled) return;
+      }
+      const baseTask = renderPng(props.image, selection, [], false);
+      const png = await renderPng(props.image, selection, marks, true);
+      const base = await baseTask;
+      const text = await props.onAction(action, png, base, marks);
       if (action === "ocr") {
         const value = typeof text === "string" ? text.trim() : "";
         setOcrText(value);
@@ -602,27 +682,13 @@ export function Annotator(props: Props) {
   const textScreen = selectedLayer?.type === "text" ? layerScreenBox(layerBounds(selectedLayer), props.selection, box) : null;
   const dock = props.desktop ? dockBar(props.selection, props.image, barSize.w, barSize.h) : null;
   const dockStyle = dock ? { left: dock.left, top: dock.top, bottom: "auto", transform: "none" } : undefined;
-  const recordStyle = dock ? recordPanelStyle(dock.left, dock.top, barSize.w, barSize.h, panelSize.w, panelSize.h) : undefined;
-  const audioEnabled = format === "mp4" && Boolean(props.ffmpeg);
-
-  function chooseFormat(next: "gif" | "mp4") {
-    if (next === "mp4" && !props.ffmpeg) return;
-    setFormat(next);
-    if (next === "gif") setAudio("none");
-  }
-
-  function startRecord() {
-    const chosen = format === "mp4" && props.ffmpeg ? "mp4" : "gif";
-    props.onRecord?.({ format: chosen, audio: chosen === "gif" ? "none" : audio, cursor: showCursor });
-    setRecordOpen(false);
-  }
 
   return (
     <div className={props.desktop ? "anno-layer" : "editor-root"}>
       <div className="stage" ref={stageRef} style={stageStyle} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp}>
         {!props.desktop && <img src={props.image.src} alt="" draggable={false} />}
         <Shade box={box} />
-        <canvas ref={canvasRef} className="anno" style={{ left: box.left, top: box.top, width: box.width, height: box.height }} />
+        <canvas ref={canvasRef} className="anno" hidden={shown.length === 0} style={{ left: box.left, top: box.top, width: box.width, height: box.height }} />
         <div className="hole" style={{ left: box.left, top: box.top, width: box.width, height: box.height }} />
         {props.editableSelection && <SelectionHandles box={box} />}
         {selected && !textDraft && <Handles layer={selectedLayer} box={textScreen ?? box} />}
@@ -700,7 +766,7 @@ export function Annotator(props: Props) {
         <span className="split" />
         {props.mode === "capture" && props.onScroll && <button title={t("scroll")} onClick={props.onScroll}><ToolIcon name="scroll" /></button>}
         {props.mode === "capture" && props.onRecord && (
-          <button title={t("record")} className={recordOpen ? "on" : ""} onClick={() => setRecordOpen((open) => !open)}><ToolIcon name="record" /></button>
+          <button title={t("record")} onClick={() => props.onRecord?.()}><ToolIcon name="record" /></button>
         )}
         {props.mode === "editor" && props.onRotate && <button title={t("rotate")} onClick={() => props.onRotate?.(layers)}><ToolIcon name="rotate" /></button>}
         {props.mode === "editor" && props.onCrop && (
@@ -714,51 +780,31 @@ export function Annotator(props: Props) {
         <button className="danger" title={t("cancel")} onClick={props.onClose}><ToolIcon name="close" /></button>
         <button className="check" title={t("copy")} onClick={() => void run("copy")}><ToolIcon name="check" /></button>
       </div>
-      {recordOpen && props.onRecord && (
-        <div className="record-panel" ref={panelRef} style={recordStyle}>
-          <div className="choice">
-            <span className="label">{t("recordFormat")}</span>
-            <button type="button" className={format === "gif" ? "seg on" : "seg"} onClick={() => chooseFormat("gif")}>GIF</button>
-            <button type="button" className={format === "mp4" ? "seg on" : "seg"} disabled={!props.ffmpeg} title={props.ffmpeg ? "MP4" : t("recordNeedFfmpeg")} onClick={() => chooseFormat("mp4")}>MP4</button>
-          </div>
-          <div className="choice">
-            <span className="label">{t("recordAudio")}</span>
-            <button type="button" className={audio === "none" ? "seg on" : "seg"} disabled={!audioEnabled} onClick={() => setAudio("none")}>{t("recordMute")}</button>
-            <button type="button" className={audio === "mic" ? "seg on" : "seg"} disabled={!audioEnabled} onClick={() => setAudio("mic")}>{t("recordMic")}</button>
-            <button type="button" className={audio === "speaker" ? "seg on" : "seg"} disabled={!audioEnabled} onClick={() => setAudio("speaker")}>{t("recordSpeaker")}</button>
-          </div>
-          <div className="choice">
-            <span className="label">{t("recordCursor")}</span>
-            <button type="button" className={showCursor ? "seg on" : "seg"} onClick={() => setShowCursor(true)}>{t("recordShow")}</button>
-            <button type="button" className={!showCursor ? "seg on" : "seg"} onClick={() => setShowCursor(false)}>{t("recordHide")}</button>
-          </div>
-          {!props.ffmpeg && <p className="hint">{t("recordNeedFfmpeg")}</p>}
-          {format === "gif" && props.ffmpeg && <p className="hint">{t("recordGifSilent")}</p>}
-          {audioEnabled && audio === "speaker" && <p className="hint">{t("recordSpeakerHint")}</p>}
-          <button
-            type="button"
-            className="start"
-            data-format={format === "mp4" && props.ffmpeg ? "mp4" : "gif"}
-            data-audio={format === "gif" || !props.ffmpeg ? "none" : audio}
-            data-cursor={showCursor ? "show" : "hide"}
-            onClick={startRecord}
-          >{t("recordStart")}</button>
-        </div>
-      )}
       {((tool !== "select" && tool !== "number") || textSelected) && (
         <div className="subbar" onPointerDown={holdTextFocus} onPointerUp={releaseTextFocus} onPointerCancel={releaseTextFocus} style={dock ? { left: dock.left, top: dock.subTop, bottom: "auto", transform: "none" } : undefined}>
           {(tool !== "select" && tool !== "number" || textSelected || textDraft) && COLORS.map((swatch) => (
-            <button key={swatch} className={color === swatch ? "swatch on" : "swatch"} style={{ background: swatch }} onMouseDown={(event) => event.preventDefault()} onClick={() => changeColor(swatch)} />
+            <button key={swatch} className={(selectedLayer?.type === "highlight" ? selectedLayer.color ?? color : color) === swatch ? "swatch on" : "swatch"} style={{ background: swatch }} onMouseDown={(event) => event.preventDefault()} onClick={() => changeColor(swatch)} />
           ))}
           {(tool === "rect" || tool === "ellipse" || tool === "arrow" || tool === "brush") && (
             <label>{thickness}<input type="range" min={2} max={16} value={thickness} onChange={(event) => setThickness(Number(event.target.value))} /></label>
           )}
           {(tool === "rect" || tool === "ellipse") && <label><input type="checkbox" checked={filled} onChange={(event) => setFilled(event.target.checked)} />{t("fill")}</label>}
-          {tool === "highlight" && <label><input type="checkbox" checked={ellipseHighlight} onChange={(event) => setEllipseHighlight(event.target.checked)} />{t("ellipseShape")}</label>}
+          {tool === "highlight" && <label><input type="checkbox" checked={selectedLayer?.type === "highlight" ? selectedLayer.ellipse : ellipseHighlight} onChange={(event) => setHighlightEllipse(event.target.checked)} />{t("ellipseShape")}</label>}
           {(tool === "text" || tool === "watermark" || textSelected) && (
             <label>{fontSize}<input type="range" min={MIN_FONT} max={MAX_FONT} value={fontSize} onPointerDown={rememberFontSize} onPointerUp={commitFontSize} onLostPointerCapture={commitFontSize} onChange={(event) => changeFontSize(Number(event.target.value))} /></label>
           )}
-          {tool === "watermark" && <input value={watermark} onChange={(event) => setWatermark(event.target.value)} />}
+          {tool === "watermark" && (
+            <input
+              value={watermark}
+              onFocus={rememberWatermarkText}
+              onBlur={commitWatermarkText}
+              onChange={(event) => {
+                const text = event.target.value;
+                setWatermark(text);
+                patchWatermarkText(text);
+              }}
+            />
+          )}
           {tool === "mosaic" && (
             <>
               <label>{block}<input type="range" min={4} max={32} value={block} onChange={(event) => setBlock(Number(event.target.value))} /></label>
@@ -781,7 +827,7 @@ export function Annotator(props: Props) {
   );
 }
 
-function selectionCss(selection: Rect, image: HTMLImageElement, frame: { w: number; h: number }, desktop: boolean) {
+function selectionCss(selection: Rect, image: ShotImage, frame: { w: number; h: number }, desktop: boolean) {
   const width = frame.w || (desktop ? window.innerWidth : image.naturalWidth);
   const height = frame.h || (desktop ? window.innerHeight : image.naturalHeight);
   const sx = width / Math.max(image.naturalWidth, 1);
@@ -789,18 +835,7 @@ function selectionCss(selection: Rect, image: HTMLImageElement, frame: { w: numb
   return { left: selection.x * sx, top: selection.y * sy, width: Math.max(0, selection.w * sx), height: Math.max(0, selection.h * sy) };
 }
 
-function recordPanelStyle(toolbarLeft: number, toolbarTop: number, toolbarWidth: number, toolbarHeight: number, panelWidth: number, panelHeight: number) {
-  const viewW = Math.max(window.innerWidth, 1);
-  const viewH = Math.max(window.innerHeight, 1);
-  let left = toolbarLeft + (toolbarWidth - panelWidth) / 2;
-  left = Math.max(8, Math.min(left, viewW - 8 - panelWidth));
-  let top = toolbarTop - 8 - panelHeight;
-  if (top < 8) top = toolbarTop + toolbarHeight + 8;
-  if (top + panelHeight > viewH - 8) top = Math.max(8, viewH - 8 - panelHeight);
-  return { left, top, bottom: "auto" as const, transform: "none" };
-}
-
-function dockBar(selection: Rect, image: HTMLImageElement, barW: number, barH: number) {
+function dockBar(selection: Rect, image: ShotImage, barW: number, barH: number) {
   const viewW = Math.max(window.innerWidth, 1);
   const viewH = Math.max(window.innerHeight, 1);
   const sx = viewW / Math.max(image.naturalWidth, 1);
@@ -940,7 +975,7 @@ function createDraft(id: string, tool: Tool, point: { x: number; y: number }, co
     case "mosaic":
       return { id, type: "mosaic", points: [point], radius, block };
     case "highlight":
-      return { id, type: "highlight", x: point.x, y: point.y, w: 0, h: 0, ellipse };
+      return { id, type: "highlight", x: point.x, y: point.y, w: 0, h: 0, ellipse, color };
     default:
       return null;
   }

@@ -8,23 +8,31 @@ function role(): string {
 
 export function ScrollChrome() {
   const { t } = useI18n();
-  const frame = role() === "frame";
+  const kind = role();
+  const frame = kind === "frame" || kind === "record";
   const [grown, setGrown] = useState(0);
+  const [reverse, setReverse] = useState(false);
   useEffect(() => {
     if (frame) return;
     const id = window.setInterval(() => {
-      void scrollProgress().then(setGrown).catch(() => undefined);
+      void scrollProgress().then((status) => {
+        setGrown(status.height);
+        setReverse(status.reverse);
+      }).catch(() => undefined);
     }, 200);
     return () => window.clearInterval(id);
   }, [frame]);
   if (frame) {
-    return <div className="scroll-frame" />;
+    return <div className={kind === "record" ? "record-frame" : "scroll-frame"} />;
   }
+  const label = reverse ? t("scrollReverse") : grown > 0 ? `${t("scrollStitched")} ${grown}px` : t("scrollHint");
   return (
     <div className="scroll-hud">
-      <span>{grown > 0 ? `${t("scrollStitched")} ${grown}px` : t("scrollHint")}</span>
-      <button type="button" className="danger" onClick={() => { void cancelScroll(); }}>{t("cancel")}</button>
-      <button type="button" className="check" onClick={() => { void finishScroll(); }}>{t("done")}</button>
+      <span className={reverse ? "reverse" : ""}>{label}</span>
+      <button type="button" title={t("scrollEdit")} onClick={() => { void finishScroll("edit"); }}>{t("scrollEdit")}</button>
+      <button type="button" title={t("scrollSave")} onClick={() => { void finishScroll("save"); }}>{t("scrollSave")}</button>
+      <button type="button" className="danger" title={t("cancel")} onClick={() => { void cancelScroll(); }}>{t("cancel")}</button>
+      <button type="button" className="check" title={t("scrollCopy")} onClick={() => { void finishScroll("copy"); }}>{t("scrollCopy")}</button>
     </div>
   );
 }

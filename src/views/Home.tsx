@@ -17,40 +17,49 @@ export function Home() {
     return () => stop();
   }, []);
 
+  const captureKeys = shortcutKeys(settings.captureShortcut);
+  const pinKeys = shortcutKeys(settings.pinShortcut);
+
   return (
     <main className="home">
-      <header>
-        <p className="mark">Shotlet</p>
+      <header className="home-top">
         <h1>{t("tagline")}</h1>
+        <nav className="home-nav">
+          <button className="ghost" onClick={() => void openHistory()}>{t("history")}</button>
+          <button className="ghost" onClick={() => void openSettings()}>{t("settings")}</button>
+        </nav>
       </header>
-      <button className="primary" disabled={busy} onClick={() => {
+      <button className="primary home-capture" disabled={busy} onClick={() => {
         setBusy(true);
         setMessage("");
         startCapture().catch((error: unknown) => {
           setMessage(error instanceof Error ? error.message : String(error));
         }).finally(() => setBusy(false));
-      }}>{t("capture")}</button>
-      <p className="keys">
-        <span className="key-group">
-          <span className="muted">{t("captureHotkey")}</span>
-          {shortcutKeys(settings.captureShortcut).map((key, index) => <kbd key={`capture-${index}`}>{key}</kbd>)}
-        </span>
-        <span className="key-group">
-          <span className="muted">{t("pinHotkey")}</span>
-          {shortcutKeys(settings.pinShortcut).map((key, index) => <kbd key={`pin-${index}`}>{key}</kbd>)}
-        </span>
-      </p>
-      <div className="row">
-        <button onClick={() => void openHistory()}>{t("history")}</button>
-        <button onClick={() => void openSettings()}>{t("settings")}</button>
-      </div>
+      }}>
+        <span>{t("capture")}</span>
+        {captureKeys.length > 0 && (
+          <span className="home-keys">
+            {captureKeys.map((key) => <kbd key={key}>{key}</kbd>)}
+          </span>
+        )}
+      </button>
       <section className="recent">
-        <h2>{t("recent")}</h2>
+        <div className="recent-head">
+          <h2>{t("recent")}</h2>
+          {pinKeys.length > 0 && (
+            <p className="key-group">
+              <span className="muted">{t("pinHotkey")}</span>
+              {pinKeys.map((key) => <kbd key={key}>{key}</kbd>)}
+            </p>
+          )}
+        </div>
         {items.length === 0 ? <p className="muted empty-note">{t("empty")}</p> : (
           <div className="thumbs">
             {items.map((item) => (
               <button key={item.id} className="thumb" title={item.name} onClick={() => void openHistory()}>
                 <img src={imageSrc(item.file)} alt={item.name} />
+                <span className="thumb-name">{item.name}</span>
+                <small>{formatWhen(item.createdAt)}</small>
               </button>
             ))}
           </div>
@@ -60,4 +69,11 @@ export function Home() {
       <footer>{t("tray")}</footer>
     </main>
   );
+}
+
+function formatWhen(ms: number): string {
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }

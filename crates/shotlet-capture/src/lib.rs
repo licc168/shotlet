@@ -1,62 +1,13 @@
+mod windows_list;
+
 use image::{imageops, RgbaImage};
-use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use xcap::Monitor;
 
-use crate::util::{err, new_id, write_png};
-use crate::windows_list::{self, WindowInfo};
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PresetRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-}
-
-fn default_mode() -> String {
-    "edit".into()
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScreenImage {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    /// Logical points on macOS, physical pixels on Windows. Window placement uses this, not `width`.
-    #[serde(default)]
-    pub point_width: u32,
-    #[serde(default)]
-    pub point_height: u32,
-    pub path: String,
-    pub screen_x: i32,
-    pub screen_y: i32,
-    /// Window rects in this screen's local coordinates. `x` above is the packed crop origin, not a window origin.
-    #[serde(default)]
-    pub windows: Vec<WindowInfo>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FrozenCapture {
-    pub path: String,
-    pub width: u32,
-    pub height: u32,
-    pub origin_x: i32,
-    pub origin_y: i32,
-    pub windows: Vec<WindowInfo>,
-    #[serde(default = "default_mode")]
-    pub mode: String,
-    #[serde(default)]
-    pub preset: Option<PresetRect>,
-    #[serde(default)]
-    pub screens: Vec<ScreenImage>,
-    #[serde(default)]
-    pub generation: u64,
-}
+use shotlet_platform::{err, new_id, write_frozen};
+pub use shotlet_types::{FrozenCapture, PresetRect, ScreenImage, WindowInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MonitorRect {
@@ -175,6 +126,30 @@ fn intersects_local(x: i32, y: i32, w: i32, h: i32, width: i32, height: i32) -> 
     x1 > 0 && y1 > 0 && x0 < i64::from(width) && y0 < i64::from(height)
 }
 
+fn cached_screen(path: &str) -> Result<Arc<RgbaImage>, String> {
+    if let Ok(slot) = preview_cache().lock() {
+        if let Some(image) = slot.get(path) {
+            return Ok(Arc::clone(image));
+        }
+    }
+    Ok(Arc::new(shotlet_platform::read_png_file(std::path::Path::new(path))?))
+}
+
+fn preview_cache() -> &'static Mutex<HashMap<String, Arc<RgbaImage>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<RgbaImage>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pixels kept from the last freeze so the overlay can paint without decoding a file.
+pub fn preview_bytes(path: &str) -> Result<Vec<u8>, String> {
+    if let Ok(slot) = preview_cache().lock() {
+        if let Some(image) = slot.get(path) {
+            return Ok(image.as_raw().clone());
+        }
+    }
+    Ok(shotlet_platform::read_png_file(std::path::Path::new(path))?.into_raw())
+}
+
 pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
     ensure_screen_capture()?;
     let (cursor_x, cursor_y) = cursor_point().ok_or("无法读取鼠标位置")?;
@@ -187,6 +162,7 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
     let mut screens = Vec::new();
     let mut packed_x: i32 = 0;
     let mut chosen: Option<usize> = None;
+    let mut fresh = HashMap::new();
     for monitor in monitors {
         let Ok(sx) = monitor.x() else { continue };
         let Ok(sy) = monitor.y() else { continue };
@@ -206,8 +182,10 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
         if width == 0 || height == 0 || width > 20000 || height > 20000 {
             continue;
         }
-        let path = capture_dir().join(format!("freeze-{}.png", new_id()));
-        write_png(&path, &image)?;
+        let path = capture_dir().join(format!("freeze-{}.shot", new_id()));
+        write_frozen(&path, &image)?;
+        let key = path.to_string_lossy().to_string();
+        fresh.insert(key.clone(), Arc::new(image));
         // Window positions share the monitor's point space, which is not the packed crop origin.
         let mut windows = windows_list::list_windows(slot.x, slot.y, slot.width as i32, slot.height as i32);
         windows.retain(|window| intersects_local(window.x, window.y, window.width, window.height, slot.width as i32, slot.height as i32));
@@ -222,7 +200,7 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
             height,
             point_width: slot.width,
             point_height: slot.height,
-            path: path.to_string_lossy().to_string(),
+            path: key,
             screen_x: slot.x,
             screen_y: slot.y,
             windows,
@@ -232,6 +210,9 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
     if screens.is_empty() {
         return Err("没有找到显示器".into());
     }
+    if let Ok(mut slot) = preview_cache().lock() {
+        *slot = fresh;
+    }
     let primary = screens[chosen.unwrap_or(0)].clone();
     Ok(FrozenCapture {
         path: primary.path.clone(),
@@ -240,7 +221,7 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
         origin_x: primary.screen_x,
         origin_y: primary.screen_y,
         windows: primary.windows.clone(),
-        mode: default_mode(),
+        mode: shotlet_types::default_mode(),
         preset: None,
         screens,
         generation: 0,
@@ -263,7 +244,7 @@ pub fn crop_screens(screens: &[ScreenImage], x: i32, y: i32, width: u32, height:
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        let image = crate::util::read_png_file(std::path::Path::new(&screen.path))?;
+        let image = cached_screen(&screen.path)?;
         let piece = crop_frozen(&image, x0 - screen.x, y0 - screen.y, (x1 - x0) as u32, (y1 - y0) as u32)?;
         imageops::overlay(&mut canvas, &piece, (x0 - x) as i64, (y0 - y) as i64);
         hit = true;
@@ -461,8 +442,43 @@ pub fn capture_rect(x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage
 #[cfg(test)]
 mod tests {
     use super::{crop_frozen, top_window_at};
-    use crate::windows_list::WindowInfo;
+    use shotlet_types::WindowInfo;
     use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn preview_returns_the_captured_pixels() {
+        let image = RgbaImage::from_pixel(2, 1, Rgba([9, 8, 7, 255]));
+        super::preview_cache()
+            .lock()
+            .unwrap()
+            .insert("memory-shot".into(), std::sync::Arc::new(image.clone()));
+        assert_eq!(super::preview_bytes("memory-shot").unwrap().as_slice(), image.as_raw().as_slice());
+    }
+
+    #[test]
+    fn crop_reads_the_preview_cache_instead_of_disk() {
+        use shotlet_types::ScreenImage;
+        let image = RgbaImage::from_fn(4, 3, |x, y| Rgba([x as u8, y as u8, 9, 255]));
+        super::preview_cache()
+            .lock()
+            .unwrap()
+            .insert("cached-crop".into(), std::sync::Arc::new(image));
+        let screens = vec![ScreenImage {
+            x: 10,
+            y: 0,
+            width: 4,
+            height: 3,
+            point_width: 4,
+            point_height: 3,
+            path: "cached-crop".into(),
+            screen_x: 0,
+            screen_y: 0,
+            windows: Vec::new(),
+        }];
+        let cropped = super::crop_screens(&screens, 11, 1, 2, 2).unwrap();
+        assert_eq!(cropped.dimensions(), (2, 2));
+        assert_eq!(cropped.get_pixel(0, 0).0, [1, 1, 9, 255]);
+    }
 
     #[test]
     fn crop_clamps_to_the_frozen_image() {

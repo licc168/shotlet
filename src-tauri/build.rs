@@ -32,7 +32,7 @@ fn compile_macos_ocr() {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let arch = macos_clang_arch();
     let mut objects = Vec::new();
-    for name in ["ocr_mac.m", "overlay_mac.m", "scroll_mac.m"] {
+    for name in ["overlay_mac.m"] {
         let source = manifest.join("src").join(name);
         println!("cargo:rerun-if-changed={}", source.display());
         let object = out_dir.join(name.replace(".m", ".o"));
@@ -49,7 +49,7 @@ fn compile_macos_ocr() {
         objects.push(object);
     }
 
-    let archive = out_dir.join("libshotlet_ocr_mac.a");
+    let archive = out_dir.join("libshotlet_overlay_mac.a");
     let mut command = std::process::Command::new("xcrun");
     command
         .args(["--sdk", "macosx", "libtool", "-static", "-arch_only", arch, "-o"])
@@ -65,10 +65,9 @@ fn compile_macos_ocr() {
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=shotlet_ocr_mac");
+    println!("cargo:rustc-link-lib=static=shotlet_overlay_mac");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=AppKit");
-    println!("cargo:rustc-link-lib=framework=Vision");
     println!("cargo:rustc-link-lib=framework=CoreGraphics");
     println!("cargo:rustc-link-lib=objc");
 }
