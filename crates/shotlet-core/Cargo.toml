@@ -11,3 +11,7 @@ shotlet-capture.workspace = true
 shotlet-media.workspace = true
 shotlet-platform.workspace = true
 shotlet-store.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+image.workspace = true

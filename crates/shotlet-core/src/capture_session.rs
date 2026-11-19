@@ -77,8 +77,33 @@ pub fn stage(state: &AppState, epoch: u64, mut frozen: FrozenCapture, mode: &str
     Ok(Some(StagedCapture { frozen, follow, generation }))
 }
 
+/// Hand out the signal the rest of the monitors wait on.
+/// A newer launch replaces it, so a late signal from the previous one is ignored.
+pub fn watch_shown(state: &AppState, generation: u64) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Ok(mut slot) = state.overlay_shown.lock() {
+        *slot = Some((generation, tx));
+    }
+    rx
+}
+
+/// The cursor screen of this generation is on screen. Waiting monitors may start.
+pub fn note_shown(state: &AppState, generation: u64) {
+    let signal = state.overlay_shown.lock().ok().and_then(|mut slot| match slot.as_ref() {
+        Some((shown, _)) if *shown == generation => slot.take().map(|(_, tx)| tx),
+        _ => None,
+    });
+    if let Some(tx) = signal {
+        let _ = tx.send(());
+    }
+}
+
 pub fn arm_follow(state: &AppState, follow: bool) {
     state.overlay_follow.store(follow, Ordering::Relaxed);
+}
+
+pub fn flush_frozen() {
+    capture::flush_frozen();
 }
 
 pub fn preview_bytes(path: &str) -> Result<Vec<u8>, String> {

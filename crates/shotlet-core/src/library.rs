@@ -14,6 +14,14 @@ pub enum LatestCopy {
     Copied,
 }
 
+pub fn trace(stage: &str) {
+    util::trace(stage);
+}
+
+pub fn set_trace_file(path: PathBuf) {
+    util::set_trace_file(path);
+}
+
 pub fn ensure_dir(app_data: &Path, settings: &Settings) -> Result<PathBuf, String> {
     let root = settings::storage_root(app_data, settings);
     std::fs::create_dir_all(&root).map_err(err)?;
@@ -151,10 +159,71 @@ pub fn image_size(path: &Path) -> Result<(u32, u32), String> {
 }
 
 pub fn write_pin_png(data: &str) -> Result<(PathBuf, u32, u32), String> {
-    let image = util::load_rgba(&util::decode_png(data)?)?;
+    let bytes = util::decode_png(data)?;
+    let (width, height) = util::png_size(&bytes)?;
     let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
-    util::write_png(&path, &image)?;
-    Ok((path, image.width(), image.height()))
+    util::write_bytes(&path, &bytes)?;
+    Ok((path, width, height))
+}
+
+/// Pin the selection straight from the frozen pixels. No canvas export, no re-encode.
+/// `x`/`y` are the selection's origin in the packed crop, the same space `copy_capture_region` uses.
+/// The history entry is written after the sticker file, on a background thread.
+pub fn pin_capture_region(state: &AppState, root: &Path, x: i32, y: i32, width: u32, height: u32) -> Result<(PathBuf, u32, u32), String> {
+    pin_taken(root, taken_capture(state)?, x, y, width, height)
+}
+
+/// The frozen pixels, copied out so the crop can run off the UI thread.
+pub fn taken_capture(state: &AppState) -> Result<(Vec<capture::ScreenImage>, String), String> {
+    let capture = state.capture.lock().map_err(err)?;
+    let item = capture.as_ref().ok_or_else(|| "没有可复制的截图".to_string())?;
+    Ok((item.screens.clone(), item.path.clone()))
+}
+
+pub fn pin_taken(root: &Path, taken: (Vec<capture::ScreenImage>, String), x: i32, y: i32, width: u32, height: u32) -> Result<(PathBuf, u32, u32), String> {
+    let (screens, path) = taken;
+    pin_region(root, &screens, &path, x, y, width, height)
+}
+
+fn pin_region(root: &Path, screens: &[capture::ScreenImage], path: &str, x: i32, y: i32, width: u32, height: u32) -> Result<(PathBuf, u32, u32), String> {
+    let cropped = if screens.is_empty() {
+        let image = util::read_png_file(Path::new(&path))?;
+        capture::crop_frozen(&image, x, y, width, height)?
+    } else {
+        capture::crop_screens(&screens, x, y, width, height)?
+    };
+    let png = util::encode_png_fast(&cropped)?;
+    let pin_path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
+    util::write_bytes(&pin_path, &png)?;
+    let root = root.to_path_buf();
+    let width = cropped.width();
+    let height = cropped.height();
+    std::thread::spawn(move || {
+        if let Err(error) = history::commit_bytes(&root, &png, &png, "[]", width, height, "", "") {
+            eprintln!("history: {error}");
+        }
+    });
+    Ok((pin_path, width, height))
+}
+
+/// Pin an annotated PNG and record it. The bytes are written as they are.
+/// History runs after the file is on disk, so the window does not wait for it.
+pub fn pin_annotated(root: &Path, png_b64: &str, base_b64: &str, document: &str) -> Result<(PathBuf, u32, u32), String> {
+    let png = util::decode_png(png_b64)?;
+    let (width, height) = util::png_size(&png)?;
+    let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
+    util::write_bytes(&path, &png)?;
+    let root = root.to_path_buf();
+    let base_b64 = base_b64.to_string();
+    let document = document.to_string();
+    std::thread::spawn(move || {
+        let base = util::decode_png(&base_b64).unwrap_or_else(|_| png.clone());
+        let base = if base.starts_with(b"\x89PNG") { base } else { png.clone() };
+        if let Err(error) = history::commit_bytes(&root, &png, &base, &document, width, height, "", "") {
+            eprintln!("history: {error}");
+        }
+    });
+    Ok((path, width, height))
 }
 
 pub fn pin_clipboard() -> Result<(PathBuf, i32, i32, u32, u32), String> {
@@ -202,9 +271,79 @@ pub fn read_image_bytes(path: &Path) -> Result<Vec<u8>, String> {
 mod tests {
     use std::path::Path;
 
-    use super::{copy_capture_region, copy_latest, ensure_dir, pin_path, read_image_bytes, save_settings, LatestCopy};
+    use base64::Engine;
+
+    use super::{copy_capture_region, copy_latest, ensure_dir, pin_annotated, pin_capture_region, pin_path, read_image_bytes, save_settings, write_pin_png, LatestCopy};
     use crate::settings::Settings;
     use crate::state::AppState;
+
+    #[test]
+    fn pin_annotated_writes_the_png_unchanged() {
+        use image::{Rgba, RgbaImage};
+        let image = RgbaImage::from_pixel(3, 2, Rgba([4, 5, 6, 255]));
+        let png = crate::util::encode_png_fast(&image).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let dir = std::env::temp_dir().join(format!("shotlet-pin-ann-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, width, height) = pin_annotated(&dir, &data, &data, "[]").unwrap();
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pin_from_the_cache_crops_the_selection() {
+        use image::{Rgba, RgbaImage};
+        let image = RgbaImage::from_fn(4, 3, |x, y| Rgba([x as u8, y as u8, 9, 255]));
+        crate::capture::remember_preview("pin-crop", std::sync::Arc::new(image));
+        let state = AppState::new(Settings::default());
+        *state.capture.lock().unwrap() = Some(crate::capture::FrozenCapture {
+            path: "pin-crop".into(),
+            width: 4,
+            height: 3,
+            origin_x: 0,
+            origin_y: 0,
+            windows: Vec::new(),
+            mode: "edit".into(),
+            preset: None,
+            screens: vec![crate::capture::ScreenImage {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 3,
+                point_width: 4,
+                point_height: 3,
+                path: "pin-crop".into(),
+                screen_x: 100,
+                screen_y: 50,
+                windows: Vec::new(),
+            }],
+            generation: 1,
+        });
+        let dir = std::env::temp_dir().join(format!("shotlet-pin-crop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, width, height) = pin_capture_region(&state, &dir, 1, 1, 2, 2).unwrap();
+        assert_eq!((width, height), (2, 2));
+        let saved = crate::util::read_png_file(&path).unwrap();
+        assert_eq!(saved.get_pixel(0, 0).0, [1, 1, 9, 255]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_pin_png_keeps_the_encoded_bytes() {
+        use image::{Rgba, RgbaImage};
+        let image = RgbaImage::from_pixel(2, 2, Rgba([8, 8, 8, 255]));
+        let png = crate::util::encode_png_fast(&image).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let (path, width, height) = write_pin_png(&data).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn an_empty_capture_cannot_be_copied() {

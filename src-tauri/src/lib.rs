@@ -27,6 +27,7 @@ pub fn run() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            commands::trace_mark,
             commands::start_capture,
             commands::overlay_ready,
             commands::set_overlay_follow,
@@ -54,6 +55,8 @@ pub fn run() {
             commands::copy_annotated,
             commands::pin_file,
             commands::pin_png_base64,
+            commands::pin_capture_region,
+            commands::pin_annotated,
             commands::pin_path,
             commands::pin_ready,
             commands::read_image_bytes,
@@ -79,6 +82,7 @@ pub fn run() {
                 dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("shotlet")
             });
             let _ = std::fs::create_dir_all(&data);
+            shotlet_core::library::set_trace_file(data.join("shotlet.log"));
             let preferences = settings::load(&data);
             app.manage(AppState::new(preferences.clone()));
             if let Err(error) = ui::install_tray(app.handle()) {

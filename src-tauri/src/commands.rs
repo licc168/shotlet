@@ -14,14 +14,22 @@ use shotlet_core::state::AppState;
 
 use crate::ui;
 
+#[tauri::command]
+pub fn trace_mark(stage: String) {
+    library::trace(&stage);
+}
+
 fn err(error: impl ToString) -> String {
     error.to_string()
 }
 
 pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
+    library::trace("f1: key");
     let mode = mode.to_string();
     let epoch = capture_session::begin(&app.state::<AppState>());
+    library::trace("f1: conceal begin");
     let covered = ui::on_main_wait(&app, |app| ui::conceal_overlays(app))?;
+    library::trace(&format!("f1: conceal done covered={covered}"));
     let mode_for_capture = mode.clone();
     let shot = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture, covered))
         .await
@@ -42,10 +50,13 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
                 return;
             }
         };
+        library::trace("f1: present begin");
         if let Err(error) = ui::present_overlays(&app_for_window, &staged.frozen, staged.generation) {
             let _ = app_for_window.emit("capture-error", error);
             return;
         }
+        library::trace("f1: present done");
+        capture_session::flush_frozen();
         capture_session::arm_follow(&state, staged.follow);
         let Some(cursor) = staged.frozen.screens.first().cloned() else {
             return;
@@ -54,8 +65,15 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
             return;
         }
         let generation = staged.generation;
+        let shown = capture_session::watch_shown(&state, generation);
         let app_later = app_for_window.clone();
+        library::trace(&format!("f1: remaining queued count={}", later.len()));
         tauri::async_runtime::spawn(async move {
+            // The other screens wait until the cursor screen has painted, so their
+            // grab and window placement do not compete with that first frame.
+            // A late or missing report must not stall them.
+            let _ = tauri::async_runtime::spawn_blocking(move || shown.recv_timeout(std::time::Duration::from_millis(250))).await;
+            library::trace("f1: remaining start");
             let added = tauri::async_runtime::spawn_blocking(move || capture_session::capture_remaining(&cursor, &later))
                 .await
                 .unwrap_or_default();
@@ -66,9 +84,11 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
                 let Some((frozen, from)) = capture_session::append_screens(&app_later.state::<AppState>(), epoch, generation, added) else {
                     return;
                 };
+                library::trace("f1: present more begin");
                 if let Err(error) = ui::present_more_overlays(&app_later, &frozen, generation, from) {
                     let _ = app_later.emit("capture-error", error);
                 }
+                capture_session::flush_frozen();
             });
         });
     })
@@ -76,7 +96,13 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn overlay_ready(window: tauri::WebviewWindow, generation: u64) -> Result<(), String> {
+pub fn overlay_ready(window: tauri::WebviewWindow, generation: u64, cursor: Option<bool>) -> Result<(), String> {
+    library::trace(&format!("f1: overlay ready generation={generation}"));
+    // Only the cursor screen releases the other monitors. A later screen reporting
+    // ready must not be what they were waiting for.
+    if cursor.unwrap_or(true) {
+        capture_session::note_shown(window.state::<AppState>().inner(), generation);
+    }
     ui::reveal_overlay(&window, generation)
 }
 
@@ -251,7 +277,7 @@ pub async fn start_capture(app: AppHandle, mode: Option<String>) -> Result<(), S
     launch_mode(app, mode.as_deref().unwrap_or("edit")).await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn current_capture(state: State<AppState>) -> Result<Option<FrozenCapture>, String> {
     capture_session::current(&state)
 }
@@ -392,6 +418,7 @@ pub fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<(), Stri
 
 #[tauri::command]
 pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Result<(), String> {
+    library::trace("pin: command");
     // Selection math is fractional. serde rejects a JSON float for i32, so the
     // command never ran and no pin file was written. Round here.
     let x = round_i32(x);
@@ -401,6 +428,43 @@ pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Res
         .await
         .map_err(err)??;
     eprintln!("pin: wrote {} ({width}x{height})", path.display());
+    library::trace("pin: file written");
+    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?
+        .ready()
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pin_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u32, screen_x: i32, screen_y: i32) -> Result<(), String> {
+    library::trace("pin: plain command");
+    // `x`/`y` address the packed crop. `screen_x`/`screen_y` are where that cut sits on the desktop.
+    let taken = library::taken_capture(&app.state::<AppState>())?;
+    let root = storage(&app)?;
+    let (path, pinned_w, pinned_h) = tauri::async_runtime::spawn_blocking(move || {
+        library::pin_taken(&root, taken, x, y, width, height)
+    })
+    .await
+    .map_err(err)??;
+    library::trace("pin: plain file written");
+    ui::open_pin(&app, path.to_string_lossy().to_string(), screen_x, screen_y, pinned_w, pinned_h)?
+        .ready()
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pin_annotated(app: AppHandle, png: String, base: String, document: String, x: f64, y: f64) -> Result<(), String> {
+    library::trace("pin: annotated command");
+    let x = round_i32(x);
+    let y = round_i32(y);
+    let root = storage(&app)?;
+    let (path, width, height) = tauri::async_runtime::spawn_blocking(move || {
+        library::pin_annotated(&root, &png, &base, &document)
+    })
+    .await
+    .map_err(err)??;
+    library::trace("pin: annotated file written");
     ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?
         .ready()
         .await?;
@@ -426,6 +490,7 @@ pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn pin_ready(window: tauri::WebviewWindow) {
+    library::trace("pin: page ready");
     ui::present_pin(window.app_handle(), window.label());
 }
 
@@ -440,7 +505,7 @@ pub fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn preview_rgba(path: String) -> Result<tauri::ipc::Response, String> {
     let bytes = capture_session::preview_bytes(&path)?;
     if bytes.len() > 96 * 1024 * 1024 {

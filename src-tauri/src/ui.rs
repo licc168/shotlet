@@ -825,6 +825,7 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
     let frame_w = width.saturating_add((PIN_GLOW as u32).saturating_mul(2));
     let frame_h = height.saturating_add((PIN_GLOW as u32).saturating_mul(2));
     let query = format!("view=pin&id={id}&x={x}&y={y}&w={width}&h={height}");
+    crate::util::trace("pin: window begin");
     eprintln!("pin: open {label} at {x},{y} size {width}x{height} frame {frame_x},{frame_y} {frame_w}x{frame_h}");
     let (tx, rx) = std::sync::mpsc::channel();
     pin_lock(&pin_signals()).insert(label.clone(), tx);
@@ -879,6 +880,7 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
         // Composite while invisible. Showing an empty webview, or focusing it
         // over the frozen capture, paints one blank frame.
         cloak_pin(&window);
+        crate::util::trace("pin: window cloaked");
     })?;
     Ok(PinWait { rx })
 }

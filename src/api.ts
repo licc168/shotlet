@@ -81,9 +81,9 @@ export async function copyCaptureRegion(x: number, y: number, width: number, hei
   await call("copy_capture_region", { x, y, width, height });
 }
 
-export async function overlayReady(generation: number): Promise<void> {
+export async function overlayReady(generation: number, cursor = true): Promise<void> {
   if (!isTauri()) return;
-  await call("overlay_ready", { generation });
+  await call("overlay_ready", { generation, cursor });
 }
 
 export async function setOverlayFollow(follow: boolean): Promise<void> {
@@ -264,12 +264,25 @@ export async function writePngBase64(data: string, dest: string): Promise<void> 
 }
 
 export async function pinPngBase64(data: string, x: number, y: number): Promise<void> {
+  tracePage("pin: click");
   if (!isTauri()) {
     sessionStorage.setItem("shotlet-pin", `data:image/png;base64,${data}`);
     window.open("/?view=pin&id=browser", "shotlet-pin", "popup,width=480,height=360");
     return;
   }
   await call("pin_png_base64", { data, x, y });
+}
+
+export async function pinCaptureRegion(x: number, y: number, width: number, height: number, screenX: number, screenY: number): Promise<void> {
+  tracePage("pin: plain click");
+  if (!isTauri()) return;
+  await call("pin_capture_region", { x, y, width, height, screenX, screenY });
+}
+
+export async function pinAnnotated(png: string, base: string, document: string, x: number, y: number): Promise<void> {
+  tracePage("pin: annotated png");
+  if (!isTauri()) return pinPngBase64(png, x, y);
+  await call("pin_annotated", { png, base, document, x, y });
 }
 
 export async function pinFile(path: string, x: number, y: number): Promise<void> {
@@ -285,7 +298,13 @@ export async function pinPath(id: string): Promise<string> {
 /** Tell the shell the sticker pixels are on the page, so it can reveal the window. */
 export async function pinReady(): Promise<void> {
   if (!isTauri()) return;
+  tracePage("pin: painted");
   await call("pin_ready");
+}
+
+export function tracePage(stage: string) {
+  if (!isTauri()) return;
+  void call("trace_mark", { stage }).catch(() => undefined);
 }
 
 export async function ocrPngBase64(data: string): Promise<string> {
@@ -442,7 +461,9 @@ export async function pickDirectory(): Promise<string | null> {
 
 export async function loadFrozen(path: string, width: number, height: number): Promise<ShotImage> {
   if (!isTauri() || !(width > 0) || !(height > 0)) return loadImage(path);
+  tracePage("f1: pixels requested");
   const bytes = await call<ArrayBuffer | Uint8Array>("preview_rgba", { path });
+  tracePage("f1: pixels received");
   const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   if (raw.byteLength !== width * height * 4) return loadImage(path);
   const canvas = document.createElement("canvas");
@@ -450,7 +471,10 @@ export async function loadFrozen(path: string, width: number, height: number): P
   canvas.height = height;
   const ctx = canvas.getContext("2d", { alpha: false });
   if (!ctx) return loadImage(path);
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(raw), width, height), 0, 0);
+  // Share the command's buffer instead of copying the whole screen again.
+  const pixels = new Uint8ClampedArray(raw.buffer, raw.byteOffset, raw.byteLength);
+  ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+  tracePage("f1: pixels painted");
   const shot = canvas as HTMLCanvasElement & ShotImage;
   shot.naturalWidth = width;
   shot.naturalHeight = height;

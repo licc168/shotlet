@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { isDoubleClick } from "../lib/pin";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
 import { useI18n } from "../i18n";
-import type { ShotImage } from "../api";
+import { tracePage, type ShotImage } from "../api";
 import { previewScale, renderPng, renderScene } from "./draw";
 import { appendStrokePoint, COLORS, hitTest, layerBounds, MAX_FONT, MIN_FONT, moveLayer, parseLayers, resizeBox, resizeTextLayer, uid, type Layer } from "./model";
 
@@ -21,6 +21,7 @@ type Props = {
   onClose: () => void;
   onAction: (action: Action, png: string, base: string, layers: Layer[]) => Promise<string | void>;
   onPlainCopy?: (selection: Rect) => Promise<boolean>;
+  onPlainPin?: (selection: Rect) => Promise<boolean>;
   onScroll?: () => void;
   onRecord?: () => void;
   onRotate?: (layers: Layer[]) => void;
@@ -608,8 +609,14 @@ export function Annotator(props: Props) {
         const handled = await props.onPlainCopy(selection);
         if (handled) return;
       }
-      const baseTask = renderPng(props.image, selection, [], false);
+      if (action === "pin" && marks.length === 0 && props.onPlainPin) {
+        const handled = await props.onPlainPin(selection);
+        if (handled) return;
+      }
+      const baseTask = action === "pin" ? Promise.resolve("") : renderPng(props.image, selection, [], false);
+      if (action === "pin") tracePage("pin: render begin");
       const png = await renderPng(props.image, selection, marks, true);
+      if (action === "pin") tracePage("pin: render done");
       const base = await baseTask;
       const text = await props.onAction(action, png, base, marks);
       if (action === "ocr") {

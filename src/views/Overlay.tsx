@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Annotator } from "../editor/Annotator";
-import { aimOverlay, cancelCapture, commitHistory, copyAnnotated, copyCaptureRegion, copyPngBase64, currentCapture, isTauri, loadFrozen, ocrPngBase64, onEvent, openRecording, overlayReady, pinPngBase64, pickSavePath, scrollCapture, setOverlayFollow, writePngBase64, type ShotImage } from "../api";
+import { aimOverlay, cancelCapture, commitHistory, copyAnnotated, copyCaptureRegion, copyPngBase64, currentCapture, isTauri, loadFrozen, ocrPngBase64, onEvent, openRecording, overlayReady, pinAnnotated, pinCaptureRegion, pickSavePath, scrollCapture, setOverlayFollow, writePngBase64, type ShotImage } from "../api";
 import { screenCssSize } from "../editor/draw";
 import { useI18n } from "../i18n";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
@@ -158,7 +158,8 @@ export function Overlay() {
 
   useEffect(() => {
     if (!capture || (!image && !error)) return;
-    void overlayReady(capture.generation ?? 0);
+    const screen = screenOf(capture, slot);
+    void overlayReady(capture.generation ?? 0, screen ? isCursorScreen(capture, screen) : false);
   }, [capture, image, error]);
 
   function toImage(event: { clientX: number; clientY: number }) {
@@ -231,6 +232,22 @@ export function Overlay() {
   const active = cursor ? windowUnder(cursor.x, cursor.y) : null;
   const live = draft ?? (active ? { x: active.x, y: active.y, w: active.width, h: active.height } : null);
   const shot = image;
+
+  async function finishPin(region: Rect): Promise<boolean> {
+    if (!isTauri()) return false;
+    const x = Math.max(0, Math.round(region.x));
+    const y = Math.max(0, Math.round(region.y));
+    const w = Math.max(1, Math.round(Math.min(region.w, shot.naturalWidth - x)));
+    const h = Math.max(1, Math.round(Math.min(region.h, shot.naturalHeight - y)));
+    try {
+      await pinCaptureRegion(screen.x + x, screen.y + y, w, h, screen.screenX + x, screen.screenY + y);
+      await cancelCapture();
+      return true;
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  }
 
   async function finishCopy(region: Rect): Promise<boolean> {
     if (copying.current) return false;
@@ -408,6 +425,7 @@ export function Overlay() {
               });
           }}
           onPlainCopy={(region) => finishCopy(region)}
+          onPlainPin={(region) => finishPin(region)}
           onRecord={() => {
             void openRecording(screen.screenX + selection.x, screen.screenY + selection.y, selection.w, selection.h).catch((reason: unknown) => {
               setError(reason instanceof Error ? reason.message : String(reason));
@@ -427,6 +445,11 @@ export function Overlay() {
                   y: Math.round(screen.screenY + selection.y),
                 }
               : null;
+            if (pinAt) {
+              await pinAnnotated(png, base, JSON.stringify(layers), pinAt.x, pinAt.y);
+              await cancelCapture();
+              return "";
+            }
             const item = await commitHistory({
               pngBase64: png,
               basePngBase64: base,
@@ -441,7 +464,6 @@ export function Overlay() {
               const dest = await pickSavePath(`${item.name}.png`);
               if (dest) await writePngBase64(png, dest);
             }
-            if (pinAt) await pinPngBase64(png, pinAt.x, pinAt.y);
             if (action !== "ocr") await cancelCapture();
             return ocrText;
           }}

@@ -28,6 +28,26 @@ pub fn encode_png_fast(image: &RgbaImage) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Width and height from a PNG header, without decoding the pixels.
+pub fn png_size(bytes: &[u8]) -> Result<(u32, u32), String> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("不是 PNG".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(err)?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(err)?);
+    if width == 0 || height == 0 {
+        return Err("选区尺寸无效".into());
+    }
+    Ok((width, height))
+}
+
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::write(path, bytes).map_err(err)
+}
+
 pub fn write_png(path: &Path, image: &RgbaImage) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(err)?;
@@ -101,6 +121,48 @@ pub fn clipboard_rgba() -> Result<RgbaImage, String> {
     RgbaImage::from_raw(width, height, image.bytes.into_owned()).ok_or_else(|| "剪贴板图像无法读取".into())
 }
 
+/// `SHOTLET_TRACE=1` appends one line per stage to `shotlet.log`.
+/// Off unless that variable is set, so a normal launch pays nothing.
+/// The shell points the file at its own data directory once that directory is known.
+pub fn trace(stage: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !ON.get_or_init(trace_enabled) {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros())
+        .unwrap_or(0);
+    let line = format!("[trace {now}] {stage}\n");
+    eprint!("{line}");
+    let path = trace_file().lock().ok().and_then(|slot| slot.clone());
+    if let Some(path) = path {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+fn trace_file() -> &'static std::sync::Mutex<Option<std::path::PathBuf>> {
+    static FILE: std::sync::OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Where stage lines are appended. Ignored unless tracing is on.
+pub fn set_trace_file(path: std::path::PathBuf) {
+    if let Ok(mut slot) = trace_file().lock() {
+        *slot = Some(path);
+    }
+}
+
+fn trace_enabled() -> bool {
+    match std::env::var("SHOTLET_TRACE") {
+        Ok(flag) => flag == "1" || flag.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TICK: AtomicU64 = AtomicU64::new(0);
@@ -112,9 +174,24 @@ mod clipboard;
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_png_fast, load_rgba, read_png_file, write_frozen, write_png};
+    use super::{encode_png_fast, load_rgba, png_size, read_png_file, write_bytes, write_frozen, write_png};
     use image::{Rgba, RgbaImage};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn png_size_reads_the_header_without_the_pixels() {
+        let image = RgbaImage::from_pixel(5, 7, Rgba([1, 2, 3, 255]));
+        let bytes = encode_png_fast(&image).unwrap();
+        assert_eq!(png_size(&bytes).unwrap(), (5, 7));
+        assert!(png_size(b"not a png").is_err());
+        let dir = std::env::temp_dir().join(format!("shotlet-png-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pin.png");
+        write_bytes(&path, &bytes).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_frozen_frame_roundtrips_without_changing_a_pixel() {

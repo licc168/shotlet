@@ -41,6 +41,9 @@ pub struct AppState {
     pub overlay_generation: AtomicU64,
     pub overlay_aim: Mutex<Option<(i32, i32)>>,
     pub overlay_pending: Mutex<Vec<OverlayPlace>>,
+    /// Set once the cursor screen of a generation has reported it is on screen.
+    /// Later monitors wait for it so they do not compete with that first paint.
+    pub overlay_shown: Mutex<Option<(u64, std::sync::mpsc::Sender<()>)>>,
 }
 
 impl AppState {
@@ -60,6 +63,7 @@ impl AppState {
             overlay_generation: AtomicU64::new(1),
             overlay_aim: Mutex::new(None),
             overlay_pending: Mutex::new(Vec::new()),
+            overlay_shown: Mutex::new(None),
         }
     }
 }
