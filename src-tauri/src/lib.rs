@@ -59,6 +59,7 @@ pub fn run() {
             commands::pin_annotated,
             commands::pin_path,
             commands::pin_ready,
+            commands::pin_standby,
             commands::read_image_bytes,
             commands::preview_rgba,
             commands::ocr_png_base64,
@@ -94,6 +95,7 @@ pub fn run() {
                 eprintln!("overlay: {error}");
             }
             ui::begin_follow(app.handle());
+            ui::replenish_pin(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {

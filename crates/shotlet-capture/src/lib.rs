@@ -184,12 +184,12 @@ pub fn preview_bytes(path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// A display grabbed after the monitor under the cursor is already on screen.
-/// `device` is the geometry already read for this monitor, so the later grab does
-/// not ask xcap for it again.
+/// `device` is the geometry already read for this monitor, so the later grab matches
+/// the handle by that instead of asking xcap for it again.
 #[derive(Clone)]
 pub struct LaterMonitor {
-    pub device: MonitorRect,
-    pub slot: MonitorRect,
+    device: MonitorRect,
+    slot: MonitorRect,
 }
 
 pub struct FreezeShot {
@@ -218,7 +218,7 @@ pub fn freeze_under_cursor() -> Result<FreezeShot, String> {
         let slot = cursor_space_for(&monitor.name().unwrap_or_default(), device, &os_monitors);
         prepared.push(PreparedMonitor { monitor, device, slot });
     }
-    prepared.sort_by_key(|item| (item.device.x, item.device.y));
+    prepared.sort_by_key(|item| (item.slot.x, item.slot.y));
     trace(&format!("capture: monitors ready count={}", prepared.len()));
     if prepared.is_empty() {
         return Err("没有找到显示器".into());
@@ -231,14 +231,14 @@ pub fn freeze_under_cursor() -> Result<FreezeShot, String> {
     let mut primary = None;
     let mut later = Vec::new();
     for index in order {
-        let item = &prepared[index];
+        let slot = prepared[index].slot;
         if primary.is_none() {
-            if let Some(screen) = capture_published(&item.monitor, item.slot, 0) {
+            if let Some(screen) = capture_published(&prepared[index].monitor, slot, 0) {
                 primary = Some(screen);
                 continue;
             }
         }
-        later.push(LaterMonitor { device: item.device, slot: item.slot });
+        later.push(LaterMonitor { device: prepared[index].device, slot });
     }
     let Some(primary) = primary else {
         return Err("没有找到显示器".into());
@@ -268,10 +268,17 @@ pub fn capture_later(pending: &[LaterMonitor], mut packed_x: i32) -> Vec<ScreenI
     let Ok(monitors) = Monitor::all() else {
         return Vec::new();
     };
-    let placed = monitor_devices(&monitors);
+    // The handle cannot cross a thread, so the monitors are listed again. Each one
+    // is matched by the geometry stored the first time, which is not read again.
+    let mut matched = Vec::new();
+    for monitor in &monitors {
+        if let Some(device) = device_rect(monitor) {
+            matched.push((monitor, device));
+        }
+    }
     let mut screens = Vec::new();
     for item in pending {
-        let Some(monitor) = placed.iter().find(|(_, device)| *device == item.device).map(|(monitor, _)| monitor) else {
+        let Some(monitor) = matched.iter().find(|(_, device)| *device == item.device).map(|(monitor, _)| *monitor) else {
             continue;
         };
         let Some(screen) = capture_published(monitor, item.slot, packed_x) else {
@@ -293,10 +300,6 @@ fn device_rect(monitor: &Monitor) -> Option<MonitorRect> {
         return None;
     }
     Some(MonitorRect { x, y, width, height })
-}
-
-fn monitor_devices(monitors: &[Monitor]) -> Vec<(&Monitor, MonitorRect)> {
-    monitors.iter().filter_map(|monitor| device_rect(monitor).map(|device| (monitor, device))).collect()
 }
 
 fn hit_slot(slot: MonitorRect, x: i32, y: i32) -> bool {

@@ -489,6 +489,11 @@ pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn pin_standby(window: tauri::WebviewWindow) {
+    ui::note_pin_standby(window.app_handle(), window.label());
+}
+
+#[tauri::command]
 pub fn pin_ready(window: tauri::WebviewWindow) {
     library::trace("pin: page ready");
     ui::present_pin(window.app_handle(), window.label());

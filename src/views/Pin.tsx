@@ -1,7 +1,7 @@
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { copyFile, isTauri, loadImage, pinPath, pinReady } from "../api";
+import { copyFile, isTauri, loadImage, onEvent, pinPath, pinReady, pinStandby } from "../api";
 import { useI18n } from "../i18n";
 import {
   PIN_MAX_OPACITY,
@@ -31,32 +31,58 @@ export function Pin() {
   const resizeRequestRef = useRef(0);
   const placedRef = useRef(false);
   const revealedRef = useRef(false);
+  const placeRef = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
-    const id = new URLSearchParams(location.search).get("id") ?? "";
     let cancel = false;
-    pinPath(id)
-      .then(async (path) => {
-        if (cancel) return;
-        if (!path) {
-          setFailed(t("empty"));
-          return;
-        }
-        setFile(path);
-        if (path.startsWith("data:") || path.startsWith("blob:") || path.startsWith("http")) {
-          setSrc(path);
-          return;
-        }
-        // asset:// taints or fails to paint inside a transparent pin window.
-        // Same-origin bytes are what the capture overlay already uses.
-        const image = await loadImage(path);
-        if (!cancel) setSrc(image.src);
-      })
-      .catch((reason: unknown) => {
+    const params = new URLSearchParams(location.search);
+    const id = params.get("id") ?? "";
+    const x = Number(params.get("x"));
+    const y = Number(params.get("y"));
+    if (params.has("x") && params.has("y") && Number.isFinite(x) && Number.isFinite(y)) {
+      placeRef.current = { x: Math.round(x), y: Math.round(y) };
+    }
+    async function show(path: string) {
+      if (cancel) return;
+      if (!path) {
+        setFailed(t("empty"));
+        return;
+      }
+      setFailed("");
+      setFile(path);
+      if (path.startsWith("data:") || path.startsWith("blob:") || path.startsWith("http")) {
+        setSrc(path);
+        return;
+      }
+      // asset:// taints or fails to paint inside a transparent pin window.
+      // Same-origin bytes are what the capture overlay already uses.
+      const image = await loadImage(path);
+      if (!cancel) setSrc(image.src);
+    }
+    let stop: () => void = () => undefined;
+    if (id) {
+      pinPath(id).then(show).catch((reason: unknown) => {
         if (!cancel) setFailed(reason instanceof Error ? reason.message : String(reason));
       });
+    } else if (isTauri()) {
+      // A warmed window has no picture yet. Tell the shell it can be used, then
+      // wait for the path and the position to arrive.
+      void pinStandby();
+      onEvent<{ path: string; x: number; y: number }>("pin-assign", (payload) => {
+        if (cancel || !payload?.path) return;
+        placeRef.current = { x: Math.round(payload.x), y: Math.round(payload.y) };
+        placedRef.current = false;
+        revealedRef.current = false;
+        naturalRef.current = null;
+        void show(payload.path);
+      }).then((unlisten) => {
+        if (cancel) unlisten();
+        else stop = unlisten;
+      }).catch(() => undefined);
+    }
     return () => {
       cancel = true;
+      stop();
     };
   }, [t]);
 
@@ -97,13 +123,11 @@ export function Pin() {
       // Later zoom grows around the center. The glow margin stays fixed.
       if (!placedRef.current) {
         placedRef.current = true;
-        const params = new URLSearchParams(location.search);
-        const x = Number(params.get("x"));
-        const y = Number(params.get("y"));
+        const place = placeRef.current;
         await win.setSize(new PhysicalSize(frame.w, frame.h));
         if (request !== resizeRequestRef.current) return;
-        if (params.has("x") && params.has("y") && Number.isFinite(x) && Number.isFinite(y)) {
-          const origin = pinFrameOrigin(Math.round(x), Math.round(y));
+        if (place) {
+          const origin = pinFrameOrigin(place.x, place.y);
           await win.setPosition(new PhysicalPosition(origin.x, origin.y));
         }
         return;

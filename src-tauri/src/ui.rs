@@ -750,6 +750,12 @@ const PIN_GLOW: i32 = 22;
 const PIN_REVEAL_FALLBACK: Duration = Duration::from_secs(8);
 const PIN_REVEAL_WAIT: Duration = Duration::from_secs(12);
 
+/// Labels of warmed pin windows whose page has loaded and is waiting for a picture.
+fn pin_standby() -> &'static Mutex<Vec<String>> {
+    static STANDBY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    STANDBY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn pin_signals() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>> {
     static SIGNALS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>>> = OnceLock::new();
     SIGNALS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -807,13 +813,22 @@ pub fn present_pin(app: &AppHandle, label: &str) {
 }
 
 pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<PinWait, String> {
-    let id = new_id();
+    let reused = take_standby(app);
+    // A warmed window already has its label. The picture id has to be that label,
+    // or hiding and switching groups cannot find the window.
+    let id = match &reused {
+        Some(label) => label.trim_start_matches("pin-").to_string(),
+        None => new_id(),
+    };
     let state = app.state::<AppState>();
     state.pins.lock().map_err(err)?.insert(id.clone(), path);
     let group = *state.pin_group.lock().map_err(err)?;
     state.pin_groups.lock().map_err(err)?.insert(id.clone(), group);
     if let Ok(mut hidden) = state.pins_hidden.lock() {
         *hidden = false;
+    }
+    if let Some(label) = reused {
+        return assign_standby(app, label, id, x, y, width, height);
     }
     let width = width.max(1);
     let height = height.max(1);
@@ -882,7 +897,115 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
         cloak_pin(&window);
         crate::util::trace("pin: window cloaked");
     })?;
+    // The next pin should not pay for creating a window. Build one now, hidden,
+    // so it is loaded by the time the next sticker is asked for.
+    replenish_pin(app);
     Ok(PinWait { rx })
+}
+
+/// Hand a picture to a window that was built ahead of time.
+fn assign_standby(app: &AppHandle, label: String, id: String, x: i32, y: i32, width: u32, height: u32) -> Result<PinWait, String> {
+    let width = width.max(1);
+    let height = height.max(1);
+    crate::util::trace("pin: reuse standby");
+    eprintln!("pin: reuse {label} as {id} at {x},{y} size {width}x{height}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    pin_lock(&pin_signals()).insert(label.clone(), tx);
+    let timeout_app = app.clone();
+    let timeout_label = label.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PIN_REVEAL_FALLBACK);
+        let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
+    });
+    let path = path_of(app, &id);
+    let payload = PinAssign { id, path, x, y, width, height };
+    app.emit_to(&label, "pin-assign", &payload).map_err(err)?;
+    replenish_pin(app);
+    Ok(PinWait { rx })
+}
+
+fn path_of(app: &AppHandle, id: &str) -> String {
+    app.state::<AppState>()
+        .pins
+        .lock()
+        .ok()
+        .and_then(|pins| pins.get(id).cloned())
+        .unwrap_or_default()
+}
+
+/// The warmed page has registered its listener. It may be used from now on.
+pub fn note_pin_standby(app: &AppHandle, label: &str) {
+    if !label.starts_with("pin-") {
+        return;
+    }
+    let id = label.trim_start_matches("pin-");
+    let assigned = app
+        .state::<AppState>()
+        .pin_groups
+        .lock()
+        .ok()
+        .is_some_and(|groups| groups.contains_key(id));
+    if assigned {
+        return;
+    }
+    pin_lock(&pin_standby()).push(label.to_string());
+    crate::util::trace("pin: standby ready");
+}
+
+fn take_standby(app: &AppHandle) -> Option<String> {
+    let mut standby = pin_lock(&pin_standby());
+    while let Some(label) = standby.pop() {
+        if app.get_webview_window(&label).is_some() {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Build one hidden pin window. It carries no picture until a pin reuses it.
+pub fn replenish_pin(app: &AppHandle) {
+    if !pin_lock(&pin_standby()).is_empty() {
+        return;
+    }
+    let app = app.clone();
+    let _ = on_main(&app, |app| {
+        if !pin_lock(&pin_standby()).is_empty() {
+            return;
+        }
+        let label = format!("pin-{}", new_id());
+        let window = WebviewWindowBuilder::new(app, &label, view_url("view=pin"))
+            .title("Shotlet Pin")
+            .decorations(false)
+            .always_on_top(true)
+            .resizable(true)
+            .transparent(true)
+            .shadow(false)
+            .skip_taskbar(true)
+            .focused(false)
+            .visible(false)
+            .inner_size(1.0, 1.0)
+            .min_inner_size(1.0, 1.0)
+            .background_color(tauri::utils::config::Color(0, 0, 0, 0))
+            .initialization_script(
+                "document.documentElement.dataset.view='pin';document.documentElement.style.background='transparent';var clearPin=function(){if(!document.body)return;document.body.style.margin='0';document.body.style.background='transparent';var root=document.getElementById('root');if(root)root.style.background='transparent';};clearPin();document.addEventListener('DOMContentLoaded',clearPin);",
+            )
+            .build();
+        if let Ok(window) = window {
+            cloak_pin(&window);
+            crate::util::trace("pin: standby built");
+        }
+    });
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PinAssign {
+    id: String,
+    path: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 fn abandon_pin(label: &str, error: String) {
@@ -1361,6 +1484,10 @@ fn set_pin_visibility(app: &AppHandle, group: u8, groups: &HashMap<String, u8>, 
         let Some(id) = label.strip_prefix("pin-") else {
             continue;
         };
+        // A warmed window has no picture and no group. Showing it would flash an empty sticker.
+        if !groups.contains_key(id) {
+            continue;
+        }
         let mine = groups.get(id).copied().unwrap_or(0) == group;
         if show_current && mine {
             let _ = window.show();

@@ -295,6 +295,13 @@ export async function pinPath(id: string): Promise<string> {
   return call<string>("pin_path", { id });
 }
 
+/** A warmed pin window has loaded and is waiting for a picture. */
+export async function pinStandby(): Promise<void> {
+  if (!isTauri()) return;
+  tracePage("pin: standby");
+  await call("pin_standby");
+}
+
 /** Tell the shell the sticker pixels are on the page, so it can reveal the window. */
 export async function pinReady(): Promise<void> {
   if (!isTauri()) return;
@@ -472,7 +479,9 @@ export async function loadFrozen(path: string, width: number, height: number): P
   const ctx = canvas.getContext("2d", { alpha: false });
   if (!ctx) return loadImage(path);
   // Share the command's buffer instead of copying the whole screen again.
-  const pixels = new Uint8ClampedArray(raw.buffer, raw.byteOffset, raw.byteLength);
+  const pixels = raw.buffer instanceof ArrayBuffer
+    ? new Uint8ClampedArray(raw.buffer, raw.byteOffset, raw.byteLength)
+    : new Uint8ClampedArray(raw);
   ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
   tracePage("f1: pixels painted");
   const shot = canvas as HTMLCanvasElement & ShotImage;
