@@ -52,7 +52,10 @@ opt-level = 3
 
 # Same tradeoff as DBX: dependency crates are not breakpoint-inspected.
 # Line tables keep backtraces resolvable and cut dev/test rustc memory.
+# opt-level 3 covers fdeflate, which the PNG fast path uses and which is not
+# one of the named packages above.
 [profile.dev.package."*"]
+opt-level = 3
 debug = "line-tables-only"
 
 [profile.release]

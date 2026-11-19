@@ -15,8 +15,13 @@ use shotlet_core::state::AppState;
 use crate::ui;
 
 #[tauri::command]
-pub fn trace_mark(stage: String) {
-    library::trace(&stage);
+pub fn trace_mark(stage: String, at: Option<f64>) {
+    // The page sends `performance.timeOrigin + performance.now()`, which is milliseconds.
+    // Shell lines are microseconds. Convert here so one log can be subtracted.
+    match at {
+        Some(ms) if ms.is_finite() && ms > 0.0 => library::trace_at(&stage, (ms * 1000.0).round() as u128),
+        _ => library::trace(&stage),
+    }
 }
 
 fn err(error: impl ToString) -> String {

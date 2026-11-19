@@ -1,7 +1,7 @@
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { copyFile, isTauri, loadImage, onEvent, pinPath, pinReady, pinStandby } from "../api";
+import { copyFile, isTauri, loadImage, onEvent, pinPath, pinReady, pinStandby, tracePage } from "../api";
 import { useI18n } from "../i18n";
 import {
   PIN_MAX_OPACITY,
@@ -57,6 +57,7 @@ export function Pin() {
       // asset:// taints or fails to paint inside a transparent pin window.
       // Same-origin bytes are what the capture overlay already uses.
       const image = await loadImage(path);
+      tracePage("pin: pixels arrived");
       if (!cancel) setSrc(image.src);
     }
     let stop: () => void = () => undefined;
@@ -70,6 +71,7 @@ export function Pin() {
       void pinStandby();
       onEvent<{ path: string; x: number; y: number }>("pin-assign", (payload) => {
         if (cancel || !payload?.path) return;
+        tracePage("pin: assign received");
         placeRef.current = { x: Math.round(payload.x), y: Math.round(payload.y) };
         placedRef.current = false;
         revealedRef.current = false;

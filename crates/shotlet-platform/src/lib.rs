@@ -125,15 +125,21 @@ pub fn clipboard_rgba() -> Result<RgbaImage, String> {
 /// Off unless that variable is set, so a normal launch pays nothing.
 /// The shell points the file at its own data directory once that directory is known.
 pub fn trace(stage: &str) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !ON.get_or_init(trace_enabled) {
-        return;
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_micros())
         .unwrap_or(0);
-    let line = format!("[trace {now}] {stage}\n");
+    trace_at(stage, now);
+}
+
+/// Same line as [`trace`], with a caller-supplied unix timestamp in microseconds.
+/// The page sends its own clock so the gap is not the IPC trip.
+pub fn trace_at(stage: &str, unix_micros: u128) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !ON.get_or_init(trace_enabled) {
+        return;
+    }
+    let line = format!("[trace {unix_micros}] {stage}\n");
     eprint!("{line}");
     let path = trace_file().lock().ok().and_then(|slot| slot.clone());
     if let Some(path) = path {

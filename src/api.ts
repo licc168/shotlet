@@ -311,7 +311,8 @@ export async function pinReady(): Promise<void> {
 
 export function tracePage(stage: string) {
   if (!isTauri()) return;
-  void call("trace_mark", { stage }).catch(() => undefined);
+  const at = performance.timeOrigin + performance.now();
+  void call("trace_mark", { stage, at }).catch(() => undefined);
 }
 
 export async function ocrPngBase64(data: string): Promise<string> {

@@ -1042,6 +1042,7 @@ fn reveal_pin(app: &AppHandle, label: &str) {
     let _ = window.set_always_on_top(true);
     let _ = window.set_focus();
     signal_pin(label, Ok(()));
+    crate::util::trace("pin: revealed");
     eprintln!("pin: window shown {label}");
 }
 

@@ -18,6 +18,10 @@ pub fn trace(stage: &str) {
     util::trace(stage);
 }
 
+pub fn trace_at(stage: &str, unix_micros: u128) {
+    util::trace_at(stage, unix_micros);
+}
+
 pub fn set_trace_file(path: PathBuf) {
     util::set_trace_file(path);
 }
