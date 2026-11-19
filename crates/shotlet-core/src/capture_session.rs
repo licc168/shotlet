@@ -26,7 +26,7 @@ pub fn is_current(state: &AppState, epoch: u64) -> bool {
 /// `wait_for_hide` is set only when an overlay was actually on screen.
 pub fn grab(mode: &str, wait_for_hide: bool) -> Result<FreezeShot, String> {
     if wait_for_hide {
-        // The previous overlay must leave the screen before the pixels are frozen.
+        // Show/hide fallback only. Cloak mode flushes the compositor in the shell instead.
         std::thread::sleep(Duration::from_millis(60));
     }
     let mut shot = capture::freeze_under_cursor()?;

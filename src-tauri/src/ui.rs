@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +22,119 @@ const OVERLAY: &str = "overlay";
 /// focus, which a borderless show often does not get.
 static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
 static OVERLAY_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// `SHOTLET_OVERLAY_CLOAK=0` keeps the old show/hide path. macOS always does.
+pub fn overlay_uses_cloak() -> bool {
+    #[cfg(windows)]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SHOTLET_OVERLAY_CLOAK").ok().as_deref() != Some("0"))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MonitorBox {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn placed_boxes() -> &'static Mutex<HashMap<String, MonitorBox>> {
+    static BOXES: OnceLock<Mutex<HashMap<String, MonitorBox>>> = OnceLock::new();
+    BOXES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn revealed_labels() -> &'static Mutex<HashSet<String>> {
+    static LABELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LABELS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn set_revealed(label: &str, on: bool) {
+    if let Ok(mut labels) = revealed_labels().lock() {
+        if on {
+            labels.insert(label.to_string());
+        } else {
+            labels.remove(label);
+        }
+    }
+}
+
+fn overlay_on_screen(window: &WebviewWindow) -> bool {
+    if overlay_uses_cloak() {
+        revealed_labels().lock().map(|labels| labels.contains(window.label())).unwrap_or(false)
+    } else {
+        window.is_visible().unwrap_or(false)
+    }
+}
+
+fn place_if_moved(window: &WebviewWindow, x: i32, y: i32, width: u32, height: u32) {
+    let label = window.label().to_string();
+    let next = MonitorBox { x, y, width, height };
+    let same = placed_boxes().lock().ok().and_then(|boxes| boxes.get(&label).copied()) == Some(next);
+    if same {
+        return;
+    }
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+    let _ = window.set_size(PhysicalSize::new(width, height));
+    if let Ok(mut boxes) = placed_boxes().lock() {
+        boxes.insert(label, next);
+    }
+}
+
+fn point_box(place: &OverlayPlace) -> (u32, u32) {
+    let width = if place.point_width == 0 { place.width } else { place.point_width };
+    let height = if place.point_height == 0 { place.height } else { place.point_height };
+    (width, height)
+}
+
+/// Click-through and cloaked, so a resident fullscreen window does not take the desktop.
+fn park_overlay(window: &WebviewWindow) {
+    let _ = window.set_ignore_cursor_events(true);
+    cloak_pin(window);
+    set_revealed(window.label(), false);
+}
+
+fn unveil_overlay(window: &WebviewWindow, focus: bool) {
+    let _ = window.set_ignore_cursor_events(false);
+    uncloak_pin(window);
+    set_revealed(window.label(), true);
+    if focus {
+        let _ = window.set_focus();
+    }
+}
+
+fn arm_overlay_reveal(app: &AppHandle, label: String, generation: u64) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = on_main(&app, move |app| {
+            let Some(window) = app.get_webview_window(&label) else {
+                return;
+            };
+            let current = window.state::<AppState>().overlay_generation.load(Ordering::Relaxed);
+            if current != generation {
+                return;
+            }
+            let _ = reveal_overlay(&window, generation);
+        });
+    });
+}
+
+#[cfg(windows)]
+fn dwm_flush() {
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
+#[cfg(not(windows))]
+fn dwm_flush() {}
 
 pub fn view_url(query: &str) -> WebviewUrl {
     if cfg!(debug_assertions) {
@@ -99,6 +212,9 @@ struct OverlayShow {
     armed: bool,
     /// Which overlay window this show belongs to. Every overlay page hears every emit.
     slot: usize,
+    path: String,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -106,6 +222,18 @@ struct OverlayShow {
 struct OverlayArm {
     slot: usize,
     armed: bool,
+}
+
+fn overlay_show_payload(frozen: &FrozenCapture, slot: usize, armed: bool, generation: u64) -> OverlayShow {
+    let screen = frozen.screens.get(slot);
+    OverlayShow {
+        generation,
+        armed,
+        slot,
+        path: screen.map(|screen| screen.path.clone()).unwrap_or_else(|| frozen.path.clone()),
+        width: screen.map(|screen| screen.width).unwrap_or(frozen.width),
+        height: screen.map(|screen| screen.height).unwrap_or(frozen.height),
+    }
 }
 
 fn overlay_label(index: usize) -> String {
@@ -121,12 +249,18 @@ fn is_overlay_label(label: &str) -> bool {
 }
 
 pub fn prepare_overlay(app: &AppHandle) -> Result<(), String> {
-    let mut count = capture::monitor_rects().len();
-    if count == 0 {
-        count = 1;
-    }
+    let rects = capture::monitor_rects();
+    let count = rects.len().max(1);
     for slot in 0..count {
         prepare_overlay_slot(app, slot)?;
+        if overlay_uses_cloak() {
+            if let Some(rect) = rects.get(slot) {
+                if let Some(window) = app.get_webview_window(&overlay_label(slot)) {
+                    place_if_moved(&window, rect.x, rect.y, rect.width, rect.height);
+                    park_overlay(&window);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -184,17 +318,26 @@ fn places_for(frozen: &FrozenCapture, generation: u64) -> Vec<OverlayPlace> {
     frozen.screens.iter().enumerate().map(|(index, screen)| place_of(screen, index, generation)).collect()
 }
 
-/// Hides every overlay. Returns whether one was on screen, so the grab can wait
-/// for that window to leave the pixels.
+/// Takes every overlay off the desktop. Returns whether one was actually showing,
+/// so the grab can wait for those pixels to leave.
 pub fn conceal_overlays(app: &AppHandle) -> bool {
     let mut covered = false;
     for label in overlay_labels(app) {
-        if let Some(window) = app.get_webview_window(&label) {
-            if window.is_visible().unwrap_or(false) {
-                covered = true;
-            }
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        if overlay_on_screen(&window) {
+            covered = true;
+        }
+        if overlay_uses_cloak() {
+            park_overlay(&window);
+            let _ = app.emit_to(&label, "overlay-hide", ());
+        } else {
             let _ = window.hide();
         }
+    }
+    if covered && overlay_uses_cloak() {
+        dwm_flush();
     }
     covered
 }
@@ -217,19 +360,21 @@ pub fn present_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64
     OVERLAY_OPEN.store(true, Ordering::Relaxed);
     let aim = (frozen.origin_x, frozen.origin_y);
     for (slot, place) in places.iter().enumerate() {
-        // Show before the page paints. A hidden WebView throttles the page, so the
-        // frozen pixels would sit for about a second after F1.
-        let _ = show_overlay_place(app, place, place.x == aim.0 && place.y == aim.1);
-        app.emit_to(
-            &place.label,
-            "overlay-show",
-            OverlayShow {
-                generation,
-                armed: place.x == aim.0 && place.y == aim.1,
-                slot,
-            },
-        )
-        .map_err(err)?;
+        let armed = place.x == aim.0 && place.y == aim.1;
+        if overlay_uses_cloak() {
+            let (width, height) = point_box(place);
+            if let Some(window) = app.get_webview_window(&place.label) {
+                place_if_moved(&window, place.x, place.y, width, height);
+                park_overlay(&window);
+            }
+            arm_overlay_reveal(app, place.label.clone(), generation);
+        } else {
+            // Show before the page paints. A hidden WebView throttles the page, so the
+            // frozen pixels would sit for about a second after F1.
+            let _ = show_overlay_place(app, place, armed);
+        }
+        app.emit_to(&place.label, "overlay-show", overlay_show_payload(frozen, slot, armed, generation))
+            .map_err(err)?;
     }
     note_overlay_hwnds(app);
     Ok(())
@@ -251,17 +396,20 @@ pub fn present_more_overlays(app: &AppHandle, frozen: &FrozenCapture, generation
         pending.extend(extra.iter().cloned());
     }
     for (offset, place) in extra.iter().enumerate() {
-        let _ = show_overlay_place(app, place, place.x == aim.0 && place.y == aim.1);
-        app.emit_to(
-            &place.label,
-            "overlay-show",
-            OverlayShow {
-                generation,
-                armed: place.x == aim.0 && place.y == aim.1,
-                slot: from + offset,
-            },
-        )
-        .map_err(err)?;
+        let armed = place.x == aim.0 && place.y == aim.1;
+        let slot = from + offset;
+        if overlay_uses_cloak() {
+            let (width, height) = point_box(place);
+            if let Some(window) = app.get_webview_window(&place.label) {
+                place_if_moved(&window, place.x, place.y, width, height);
+                park_overlay(&window);
+            }
+            arm_overlay_reveal(app, place.label.clone(), generation);
+        } else {
+            let _ = show_overlay_place(app, place, armed);
+        }
+        app.emit_to(&place.label, "overlay-show", overlay_show_payload(frozen, slot, armed, generation))
+            .map_err(err)?;
     }
     note_overlay_hwnds(app);
     Ok(())
@@ -273,7 +421,7 @@ fn note_overlay_hwnds(app: &AppHandle) {
     {
         for label in overlay_labels(app) {
             let Some(window) = app.get_webview_window(&label) else { continue };
-            if !window.is_visible().unwrap_or(false) {
+            if !overlay_on_screen(&window) {
                 continue;
             }
             if let Ok(hwnd) = window.hwnd() {
@@ -328,6 +476,11 @@ pub fn reveal_overlay(window: &WebviewWindow, generation: u64) -> Result<(), Str
         .ok()
         .and_then(|slot| *slot);
     let focus = aim == Some((place.x, place.y));
+    if overlay_uses_cloak() {
+        unveil_overlay(window, focus);
+        note_overlay_hwnds(window.app_handle());
+        return Ok(());
+    }
     place_overlay_window(window, &place, focus)
 }
 
@@ -401,6 +554,12 @@ fn show_overlay_screen(app: &AppHandle, screens: &[capture::ScreenImage], index:
     }
     #[cfg(not(target_os = "macos"))]
     {
+        if overlay_uses_cloak() {
+            let (width, height) = point_box(&place);
+            place_if_moved(&window, place.x, place.y, width, height);
+            unveil_overlay(&window, make_key);
+            return;
+        }
         let _ = move_overlay_window(&window, &place);
         let _ = window.show();
     }
@@ -417,7 +576,7 @@ fn raise_hidden_overlays(app: &AppHandle, screens: &[capture::ScreenImage], key_
         let Some(window) = app.get_webview_window(&overlay_label(index)) else {
             continue;
         };
-        if window.is_visible().unwrap_or(false) {
+        if overlay_on_screen(&window) {
             continue;
         }
         show_overlay_screen(app, screens, index, false);
@@ -532,7 +691,11 @@ fn hide_extra_overlays(app: &AppHandle, count: usize) {
         let Some(window) = app.get_webview_window(&overlay_label(slot)) else {
             break;
         };
-        let _ = window.hide();
+        if overlay_uses_cloak() {
+            park_overlay(&window);
+        } else {
+            let _ = window.hide();
+        }
         slot += 1;
     }
 }
@@ -692,7 +855,12 @@ fn dismiss_overlay(app: &AppHandle) {
     }
     for label in overlay_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.hide();
+            if overlay_uses_cloak() {
+                park_overlay(&window);
+                let _ = app.emit_to(&label, "overlay-hide", ());
+            } else {
+                let _ = window.hide();
+            }
         }
     }
 }
@@ -1491,10 +1659,15 @@ pub fn conceal_visible_overlays(app: &AppHandle) -> Vec<String> {
     let mut shown = Vec::new();
     for label in overlay_labels(app) {
         let Some(window) = app.get_webview_window(&label) else { continue };
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-            shown.push(label);
+        if !overlay_on_screen(&window) {
+            continue;
         }
+        if overlay_uses_cloak() {
+            park_overlay(&window);
+        } else {
+            let _ = window.hide();
+        }
+        shown.push(label);
     }
     shown
 }
@@ -1502,7 +1675,11 @@ pub fn conceal_visible_overlays(app: &AppHandle) -> Vec<String> {
 pub fn show_overlay_labels(app: &AppHandle, labels: &[String]) {
     for label in labels {
         let Some(window) = app.get_webview_window(label) else { continue };
-        let _ = window.show();
+        if overlay_uses_cloak() {
+            unveil_overlay(&window, false);
+        } else {
+            let _ = window.show();
+        }
         let _ = window.set_always_on_top(true);
     }
 }

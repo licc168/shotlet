@@ -36,8 +36,9 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
     library::trace("f1: conceal begin");
     let covered = ui::on_main_wait(&app, |app| ui::conceal_overlays(app))?;
     library::trace(&format!("f1: conceal done covered={covered}"));
+    let wait_for_hide = covered && !ui::overlay_uses_cloak();
     let mode_for_capture = mode.clone();
-    let shot = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture, covered))
+    let shot = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture, wait_for_hide))
         .await
         .map_err(err)??;
     if !capture_session::is_current(&app.state::<AppState>(), epoch) {
@@ -71,14 +72,9 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
             return;
         }
         let generation = staged.generation;
-        let shown = capture_session::watch_shown(&state, generation);
         let app_later = app_for_window.clone();
         library::trace(&format!("f1: remaining queued count={}", later.len()));
         tauri::async_runtime::spawn(async move {
-            // The other screens wait until the cursor screen has painted, so their
-            // grab and window placement do not compete with that first frame.
-            // A late or missing report must not stall them.
-            let _ = tauri::async_runtime::spawn_blocking(move || shown.recv_timeout(std::time::Duration::from_millis(250))).await;
             library::trace("f1: remaining start");
             let added = tauri::async_runtime::spawn_blocking(move || capture_session::capture_remaining(&cursor, &later))
                 .await

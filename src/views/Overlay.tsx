@@ -59,10 +59,25 @@ export function Overlay() {
   useEffect(() => {
     let dead = false;
     let seen = -1;
+    let wave = 0;
     const stops: Array<() => void> = [];
-    async function apply(frozen: FrozenCapture | null) {
+    function dropFrame() {
+      wave += 1;
+      seen = -1;
+      ownsFollow.current = false;
+      drag.current = null;
+      draftRef.current = null;
+      setDraft(null);
+      setCursor(null);
+      setCapture(null);
+      setImage(null);
+      setSelection(null);
+      setArmed(false);
+    }
+    async function apply(frozen: FrozenCapture | null, preloaded?: ShotImage | null) {
       if (dead || !frozen) return;
       const generation = frozen.generation ?? 0;
+      const token = wave;
       // The cursor screen is shown first. This page also hears that event, and the
       // other displays arrive later with the same generation. Marking it seen before
       // this slot has pixels drops that later show, so the other screen stays blank.
@@ -87,15 +102,16 @@ export function Overlay() {
       ownsFollow.current = cursorScreen;
       setArmed(cursorScreen);
       try {
-        const loaded = await loadFrozen(screen.path || frozen.path, screen.width || frozen.width, screen.height || frozen.height);
-        if (dead || seen !== generation) return;
+        const loaded = preloaded ?? await loadFrozen(screen.path || frozen.path, screen.width || frozen.width, screen.height || frozen.height);
+        if (dead || token !== wave || seen !== generation) return;
         setImage(loaded);
         setError("");
       } catch (reason: unknown) {
-        if (dead || seen !== generation) return;
+        if (dead || token !== wave || seen !== generation) return;
         setImage(null);
         setError(reason instanceof Error ? reason.message : String(reason));
       }
+      if (dead || token !== wave || seen !== generation) return;
       const preset = frozen.preset;
       let next: Rect | null = null;
       if (preset && cursorScreen) {
@@ -104,10 +120,27 @@ export function Overlay() {
       setCapture(frozen);
       setSelection(next);
     }
-    onEvent<{ armed?: boolean; slot?: number }>("overlay-show", (payload) => {
+    onEvent<{ armed?: boolean; slot?: number; path?: string; width?: number; height?: number; generation?: number }>("overlay-show", (payload) => {
       if (typeof payload?.slot === "number" && payload.slot !== slot) return;
       if (typeof payload?.armed === "boolean") setArmed(payload.armed);
-      void currentCapture().then(apply);
+      const pixels = payload?.path && payload.width && payload.height
+        ? loadFrozen(payload.path, payload.width, payload.height).catch(() => null)
+        : Promise.resolve(null);
+      void Promise.all([currentCapture(), pixels]).then(([frozen, loaded]) => {
+        if (payload?.generation != null && (frozen?.generation ?? 0) !== payload.generation) {
+          void currentCapture().then((next) => {
+            if ((next?.generation ?? 0) === payload.generation) void apply(next, loaded);
+          });
+          return;
+        }
+        void apply(frozen, loaded);
+      });
+    }).then((stop) => {
+      if (dead) stop();
+      else stops.push(stop);
+    }).catch(() => undefined);
+    onEvent("overlay-hide", () => {
+      if (!dead) dropFrame();
     }).then((stop) => {
       if (dead) stop();
       else stops.push(stop);
