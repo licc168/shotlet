@@ -19,16 +19,25 @@ fn main() {
     tauri_build::build()
 }
 
+fn macos_clang_arch() -> &'static str {
+    match std::env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() {
+        Some("x86_64") => "x86_64",
+        Some("aarch64") => "arm64",
+        other => panic!("unsupported macOS target arch: {other:?}"),
+    }
+}
+
 fn compile_macos_ocr() {
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let arch = macos_clang_arch();
     let mut objects = Vec::new();
     for name in ["ocr_mac.m", "overlay_mac.m", "scroll_mac.m"] {
         let source = manifest.join("src").join(name);
         println!("cargo:rerun-if-changed={}", source.display());
         let object = out_dir.join(name.replace(".m", ".o"));
         let status = std::process::Command::new("xcrun")
-            .args(["--sdk", "macosx", "clang", "-fobjc-arc", "-O2", "-c"])
+            .args(["--sdk", "macosx", "clang", "-arch", arch, "-fobjc-arc", "-O2", "-c"])
             .arg(&source)
             .arg("-o")
             .arg(&object)
@@ -42,7 +51,9 @@ fn compile_macos_ocr() {
 
     let archive = out_dir.join("libshotlet_ocr_mac.a");
     let mut command = std::process::Command::new("xcrun");
-    command.args(["--sdk", "macosx", "libtool", "-static", "-o"]).arg(&archive);
+    command
+        .args(["--sdk", "macosx", "libtool", "-static", "-arch_only", arch, "-o"])
+        .arg(&archive);
     for object in &objects {
         command.arg(object);
     }

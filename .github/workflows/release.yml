@@ -5,10 +5,21 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      target:
+        description: Which installer to build
+        type: choice
+        options:
+          - all
+          - macos-aarch64
+          - macos-x64
+          - windows-x64
+        default: all
 
 jobs:
   publish:
     name: ${{ matrix.name }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == matrix.name }}
     permissions:
       contents: write
     strategy:
