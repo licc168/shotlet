@@ -55,7 +55,7 @@ test("core owns the procedures and commands only adapt them", () => {
   for (const token of ["history::", "capture::", "scroll::", "record::", "ocr::", "util::", "settings::"]) {
     assert.equal(commands.includes(token), false, `commands.rs still names ${token}`);
   }
-  for (const token of ["capture_session::", "library::", "scroll_session::", "record_session::"]) {
+  for (const token of ["capture_session::", "library::", "scroll_session::", "record_session::", "pin_session::"]) {
     assert.equal(commands.includes(token), true, `commands.rs does not call ${token}`);
   }
   const read = (name) => readFileSync(`crates/shotlet-core/src/${name}`, "utf8");

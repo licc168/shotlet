@@ -6,6 +6,7 @@ publish = false
 description = "Shotlet session state and the only crate the desktop shell calls."
 
 [dependencies]
+image.workspace = true
 serde.workspace = true
 shotlet-capture.workspace = true
 shotlet-media.workspace = true
@@ -14,4 +15,3 @@ shotlet-store.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
-image.workspace = true

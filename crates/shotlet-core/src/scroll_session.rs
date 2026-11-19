@@ -45,11 +45,11 @@ pub fn prepare(request: &ScrollRequest) -> Result<ScrollFrame, String> {
         return Err("滚动选区太小".into());
     }
     scroll::begin()?;
-    let (visual_x, visual_y, visual_w, visual_h) = scroll::visual_rect(
+    let (visual_x, visual_y, visual_w, visual_h) = crate::capture_session::desktop_rect(
         request.screen_x,
         request.screen_y,
-        x,
-        y,
+        x as i32,
+        y as i32,
         width,
         height,
         request.image_w,

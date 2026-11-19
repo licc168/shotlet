@@ -5,6 +5,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
 use shotlet_core::capture_session::{self, FrozenCapture};
+use shotlet_core::pin_session;
 use shotlet_core::editor::{self, EditorView};
 use shotlet_core::library::{self, CommitRequest, HistoryItem, LatestCopy};
 use shotlet_core::record_session::{self, RecordStatus};
@@ -441,36 +442,76 @@ pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Res
 }
 
 #[tauri::command]
-pub async fn pin_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u32, screen_x: i32, screen_y: i32) -> Result<(), String> {
+pub async fn pin_capture_region(
+    app: AppHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    screen_x: i32,
+    screen_y: i32,
+    local_x: i32,
+    local_y: i32,
+    bitmap_w: u32,
+    bitmap_h: u32,
+    point_w: u32,
+    point_h: u32,
+) -> Result<(), String> {
     library::trace("pin: plain command");
-    // `x`/`y` address the packed crop. `screen_x`/`screen_y` are where that cut sits on the desktop.
+    // `x`/`y` address the packed crop. The desktop cut is derived here, not on the page.
+    let (place_x, place_y, place_w, place_h) = capture_session::desktop_rect(screen_x, screen_y, local_x, local_y, width, height, bitmap_w, bitmap_h, point_w, point_h);
     let taken = library::taken_capture(&app.state::<AppState>())?;
     let root = storage(&app)?;
-    let (path, pinned_w, pinned_h) = tauri::async_runtime::spawn_blocking(move || {
+    let (path, _pinned_w, _pinned_h) = tauri::async_runtime::spawn_blocking(move || {
         library::pin_taken(&root, taken, x, y, width, height)
     })
     .await
     .map_err(err)??;
     library::trace("pin: plain file written");
-    ui::open_pin(&app, path.to_string_lossy().to_string(), screen_x, screen_y, pinned_w, pinned_h)?
+    ui::open_pin(&app, path.to_string_lossy().to_string(), place_x, place_y, place_w, place_h)?
         .ready()
         .await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn pin_annotated(app: AppHandle, png: String, base: String, document: String, x: f64, y: f64) -> Result<(), String> {
+pub async fn pin_annotated(
+    app: AppHandle,
+    png: String,
+    base: String,
+    document: String,
+    screen_x: f64,
+    screen_y: f64,
+    local_x: f64,
+    local_y: f64,
+    width: f64,
+    height: f64,
+    bitmap_w: f64,
+    bitmap_h: f64,
+    point_w: f64,
+    point_h: f64,
+) -> Result<(), String> {
     library::trace("pin: annotated command");
-    let x = round_i32(x);
-    let y = round_i32(y);
+    let (place_x, place_y, place_w, place_h) = capture_session::desktop_rect(
+        round_i32(screen_x),
+        round_i32(screen_y),
+        round_i32(local_x),
+        round_i32(local_y),
+        width.round().max(1.0) as u32,
+        height.round().max(1.0) as u32,
+        bitmap_w.round().max(1.0) as u32,
+        bitmap_h.round().max(1.0) as u32,
+        point_w.round().max(0.0) as u32,
+        point_h.round().max(0.0) as u32,
+    );
     let root = storage(&app)?;
-    let (path, width, height) = tauri::async_runtime::spawn_blocking(move || {
+    let (path, _width, _height) = tauri::async_runtime::spawn_blocking(move || {
         library::pin_annotated(&root, &png, &base, &document)
     })
     .await
     .map_err(err)??;
     library::trace("pin: annotated file written");
-    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?
+    ui::open_pin(&app, path.to_string_lossy().to_string(), place_x, place_y, place_w, place_h)?
         .ready()
         .await?;
     Ok(())
@@ -495,7 +536,14 @@ pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn pin_standby(window: tauri::WebviewWindow) {
-    ui::note_pin_standby(window.app_handle(), window.label());
+    if pin_session::report_standby(window.state::<AppState>().inner(), window.label()) {
+        library::trace("pin: standby ready");
+    }
+}
+
+#[tauri::command]
+pub fn pin_zoom(window: tauri::WebviewWindow, scale: f64) {
+    ui::zoom_pin(&window, scale);
 }
 
 #[tauri::command]
@@ -642,8 +690,32 @@ pub fn ffmpeg_available() -> bool {
 }
 
 #[tauri::command(async)]
-pub fn open_recording(app: AppHandle, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
-    let planned = record_session::place(&app.state::<AppState>(), x, y, width, height)?;
+pub fn open_recording(
+    app: AppHandle,
+    screen_x: f64,
+    screen_y: f64,
+    local_x: f64,
+    local_y: f64,
+    width: f64,
+    height: f64,
+    bitmap_w: f64,
+    bitmap_h: f64,
+    point_w: f64,
+    point_h: f64,
+) -> Result<(), String> {
+    let (x, y, w, h) = capture_session::desktop_rect(
+        screen_x.round() as i32,
+        screen_y.round() as i32,
+        local_x.round() as i32,
+        local_y.round() as i32,
+        width.round().max(1.0) as u32,
+        height.round().max(1.0) as u32,
+        bitmap_w.round().max(1.0) as u32,
+        bitmap_h.round().max(1.0) as u32,
+        point_w.round().max(0.0) as u32,
+        point_h.round().max(0.0) as u32,
+    );
+    let planned = record_session::place(&app.state::<AppState>(), f64::from(x), f64::from(y), f64::from(w), f64::from(h))?;
     match ui::on_main_wait(&app, move |app| {
         ui::hide_overlay(app);
         let _ = ui::open_record_border(app, planned.x, planned.y, planned.width, planned.height);

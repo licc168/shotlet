@@ -1,51 +1,46 @@
-import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { copyFile, isTauri, loadImage, onEvent, pinPath, pinReady, pinStandby, tracePage } from "../api";
+import { copyFile, isTauri, loadImage, onEvent, pinPath, pinReady, pinStandby, pinZoom, tracePage } from "../api";
 import { useI18n } from "../i18n";
 import {
   PIN_MAX_OPACITY,
   PIN_MIN_OPACITY,
   PIN_OPACITY_STEP,
-  centeredOrigin,
   isDoubleClick,
   nextScale,
-  pinFrameOrigin,
-  pinFrameSize,
   pinGlowCssPx,
-  pinWindowSize,
   type ClickStamp,
 } from "../lib/pin";
 
 export function Pin() {
   const { t } = useI18n();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [src, setSrc] = useState("");
   const [file, setFile] = useState("");
   const [failed, setFailed] = useState("");
-  const [scale, setScale] = useState(1);
   const [opacity, setOpacity] = useState(1);
   const [menu, setMenu] = useState(false);
+  const [glow, setGlow] = useState(() => pinGlowCssPx(window.devicePixelRatio));
   const pinRef = useRef<HTMLDivElement>(null);
-  const naturalRef = useRef<{ w: number; h: number } | null>(null);
   const lastClickRef = useRef<ClickStamp | null>(null);
-  const resizeRequestRef = useRef(0);
-  const placedRef = useRef(false);
   const revealedRef = useRef(false);
-  const placeRef = useRef<{ x: number; y: number } | null>(null);
+  const scaleRef = useRef(1);
+
+  useEffect(() => {
+    const onResize = () => setGlow(pinGlowCssPx(window.devicePixelRatio));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     let cancel = false;
     const params = new URLSearchParams(location.search);
     const id = params.get("id") ?? "";
-    const x = Number(params.get("x"));
-    const y = Number(params.get("y"));
-    if (params.has("x") && params.has("y") && Number.isFinite(x) && Number.isFinite(y)) {
-      placeRef.current = { x: Math.round(x), y: Math.round(y) };
-    }
     async function show(path: string) {
       if (cancel) return;
       if (!path) {
-        setFailed(t("empty"));
+        setFailed(tRef.current("empty"));
         return;
       }
       setFailed("");
@@ -55,7 +50,6 @@ export function Pin() {
         return;
       }
       // asset:// taints or fails to paint inside a transparent pin window.
-      // Same-origin bytes are what the capture overlay already uses.
       const image = await loadImage(path);
       tracePage("pin: pixels arrived");
       if (!cancel) setSrc(image.src);
@@ -66,16 +60,12 @@ export function Pin() {
         if (!cancel) setFailed(reason instanceof Error ? reason.message : String(reason));
       });
     } else if (isTauri()) {
-      // A warmed window has no picture yet. Tell the shell it can be used, then
-      // wait for the path and the position to arrive.
+      // A warmed window has no picture yet. Report once, then wait for the picture.
       void pinStandby();
-      onEvent<{ path: string; x: number; y: number }>("pin-assign", (payload) => {
+      onEvent<{ path: string }>("pin-assign", (payload) => {
         if (cancel || !payload?.path) return;
         tracePage("pin: assign received");
-        placeRef.current = { x: Math.round(payload.x), y: Math.round(payload.y) };
-        placedRef.current = false;
         revealedRef.current = false;
-        naturalRef.current = null;
         void show(payload.path);
       }).then((unlisten) => {
         if (cancel) unlisten();
@@ -86,7 +76,7 @@ export function Pin() {
       cancel = true;
       stop();
     };
-  }, [t]);
+  }, []);
 
   useEffect(() => {
     const node = pinRef.current;
@@ -95,8 +85,9 @@ export function Pin() {
       event.preventDefault();
       if (event.ctrlKey || event.metaKey) {
         setOpacity((value) => Math.min(PIN_MAX_OPACITY, Math.max(PIN_MIN_OPACITY, value + (event.deltaY < 0 ? PIN_OPACITY_STEP : -PIN_OPACITY_STEP))));
-      } else {
-        setScale((value) => nextScale(value, event.deltaY < 0));
+      } else if (isTauri()) {
+        scaleRef.current = nextScale(scaleRef.current, event.deltaY < 0);
+        void pinZoom(scaleRef.current);
       }
     };
     node.addEventListener("wheel", onWheel, { passive: false });
@@ -104,54 +95,8 @@ export function Pin() {
   }, [src]);
 
   useEffect(() => {
-    void fitPinWindow(scale);
-  }, [scale]);
-
-  useEffect(() => {
     if (failed) void revealPin(revealedRef);
   }, [failed]);
-
-  async function fitPinWindow(next: number) {
-    const natural = naturalRef.current;
-    if (!natural || !isTauri()) return;
-    const image = pinWindowSize(natural.w, natural.h, next);
-    // The window is larger than the picture so the edge light can sit outside the cut.
-    const frame = pinFrameSize(image.w, image.h);
-    const request = ++resizeRequestRef.current;
-    try {
-      const win = getCurrentWindow();
-      if (request !== resizeRequestRef.current) return;
-      // First layout is the screen cut: same pixel size, same top-left.
-      // Later zoom grows around the center. The glow margin stays fixed.
-      if (!placedRef.current) {
-        placedRef.current = true;
-        const place = placeRef.current;
-        await win.setSize(new PhysicalSize(frame.w, frame.h));
-        if (request !== resizeRequestRef.current) return;
-        if (place) {
-          const origin = pinFrameOrigin(place.x, place.y);
-          await win.setPosition(new PhysicalPosition(origin.x, origin.y));
-        }
-        return;
-      }
-      const size = await win.innerSize();
-      const pos = await win.outerPosition();
-      if (request !== resizeRequestRef.current) return;
-      const origin = centeredOrigin(pos.x, pos.y, size.width, size.height, frame.w, frame.h);
-      await win.setSize(new PhysicalSize(frame.w, frame.h));
-      if (request !== resizeRequestRef.current) return;
-      await win.setPosition(new PhysicalPosition(Math.round(origin.x), Math.round(origin.y)));
-    } catch {
-      // The pin window may already have been closed.
-    }
-  }
-
-  function onImageLoad(event: React.SyntheticEvent<HTMLImageElement>) {
-    const image = event.currentTarget;
-    if (!image.naturalWidth) return;
-    naturalRef.current = { w: image.naturalWidth, h: image.naturalHeight };
-    void fitPinWindow(scale).then(() => revealPin(revealedRef));
-  }
 
   function onPointerDown(event: React.PointerEvent) {
     if (event.button !== 0) return;
@@ -173,12 +118,11 @@ export function Pin() {
 
   if (!src) return <main className={failed ? "pin empty failed" : "pin empty"}>{failed}</main>;
 
-  const glow = `${pinGlowCssPx(window.devicePixelRatio)}px`;
   return (
     <div
       ref={pinRef}
       className="pin"
-      style={{ opacity, "--pin-glow": glow } as CSSProperties}
+      style={{ opacity, "--pin-glow": `${glow}px` } as CSSProperties}
       onPointerDown={onPointerDown}
       onDoubleClick={() => void closePin()}
       onContextMenu={(event) => { event.preventDefault(); setMenu(true); }}
@@ -188,11 +132,9 @@ export function Pin() {
         src={src}
         alt=""
         draggable={false}
-        onLoad={onImageLoad}
+        onLoad={() => void revealPin(revealedRef)}
         ref={(image) => {
-          if (image?.complete && image.naturalWidth && !naturalRef.current) {
-            onImageLoad({ currentTarget: image } as React.SyntheticEvent<HTMLImageElement>);
-          }
+          if (image?.complete && image.naturalWidth) void revealPin(revealedRef);
         }}
       />
       {menu && (

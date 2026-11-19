@@ -1,4 +1,4 @@
-pub use shotlet_core::{capture, history, ocr, record, scroll, settings, state, util};
+pub use shotlet_core::{capture, history, ocr, pin_session, record, scroll, settings, state, util};
 
 #[cfg(target_os = "macos")]
 mod hotkey_mac;
@@ -60,6 +60,7 @@ pub fn run() {
             commands::pin_path,
             commands::pin_ready,
             commands::pin_standby,
+            commands::pin_zoom,
             commands::read_image_bytes,
             commands::preview_rgba,
             commands::ocr_png_base64,
@@ -109,6 +110,11 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         let _ = commands::stop_recording(app).await;
                     });
+                }
+                WindowEvent::Destroyed if window.label().starts_with("pin-") => {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        pin_session::forget(state.inner(), window.label());
+                    }
                 }
                 _ => {}
             }

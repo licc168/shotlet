@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::capture::{self, FrozenCapture};
+use crate::pin_session::{self, PinCut, PinFrame};
 use crate::settings::{self, Settings};
 use crate::state::{AppState, OverlayPlace};
 use crate::util::{err, new_id};
@@ -750,28 +752,13 @@ const PIN_GLOW: i32 = 22;
 const PIN_REVEAL_FALLBACK: Duration = Duration::from_secs(8);
 const PIN_REVEAL_WAIT: Duration = Duration::from_secs(12);
 
-/// Labels of warmed pin windows whose page has loaded and is waiting for a picture.
-fn pin_standby() -> &'static Mutex<Vec<String>> {
-    static STANDBY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-    STANDBY.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 fn pin_signals() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>> {
     static SIGNALS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>>> = OnceLock::new();
     SIGNALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn pin_revealed() -> &'static Mutex<HashSet<String>> {
-    static REVEALED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    REVEALED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
 fn pin_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
-fn claim_pin_reveal(label: &str) -> bool {
-    pin_lock(&pin_revealed()).insert(label.to_string())
 }
 
 fn signal_pin(label: &str, result: Result<(), String>) {
@@ -812,44 +799,148 @@ pub fn present_pin(app: &AppHandle, label: &str) {
     reveal_pin(app, label);
 }
 
+fn pin_frame(x: i32, y: i32, width: u32, height: u32) -> PinFrame {
+    PinFrame {
+        x: x - PIN_GLOW,
+        y: y - PIN_GLOW,
+        width: width.max(1) as i32 + PIN_GLOW * 2,
+        height: height.max(1) as i32 + PIN_GLOW * 2,
+    }
+}
+
+fn place_pin_window(app: &AppHandle, window: &WebviewWindow, label: &str, frame: PinFrame) {
+    #[cfg(windows)]
+    place_pin_win32(window, frame);
+    #[cfg(not(windows))]
+    {
+        let size = PhysicalSize::new(frame.width.max(1) as u32, frame.height.max(1) as u32);
+        let origin = PhysicalPosition::new(frame.x, frame.y);
+        let _ = window.set_position(origin);
+        let _ = window.set_size(size);
+        // macOS sometimes applies the first size before the window has a screen.
+        let _ = window.set_position(origin);
+        let _ = window.set_size(size);
+    }
+    let _ = window.set_always_on_top(true);
+    pin_session::note_frame(app.state::<AppState>().inner(), label, frame);
+}
+
+#[cfg(windows)]
+fn place_pin_win32(window: &WebviewWindow, frame: PinFrame) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE};
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    unsafe {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), frame.x, frame.y, frame.width, frame.height, SWP_NOACTIVATE);
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_ok() {
+            let got_w = rect.right - rect.left;
+            let got_h = rect.bottom - rect.top;
+            if got_w != frame.width || got_h != frame.height {
+                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), frame.x, frame.y, frame.width, frame.height, SWP_NOACTIVATE);
+            }
+        }
+    }
+}
+
+pub fn zoom_pin(window: &WebviewWindow, scale: f64) {
+    let label = window.label().to_string();
+    let Some((content_w, content_h)) = pin_session::content_size(window.state::<AppState>().inner(), &label) else {
+        return;
+    };
+    let Ok(pos) = window.outer_position() else {
+        return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let center_x = pos.x.saturating_add(size.width as i32 / 2);
+    let center_y = pos.y.saturating_add(size.height as i32 / 2);
+    let frame = pin_session::zoomed_frame(content_w, content_h, scale, center_x, center_y, PIN_GLOW);
+    place_pin_window(window.app_handle(), window, &label, frame);
+}
+
+fn remember_pin(app: &AppHandle, label: &str, path: &str, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let group = *state.pin_group.lock().map_err(err)?;
+    if let Ok(mut hidden) = state.pins_hidden.lock() {
+        *hidden = false;
+    }
+    pin_session::assign(
+        state.inner(),
+        label,
+        group,
+        None,
+        Some(PathBuf::from(path)),
+        PinCut { x, y, width: width.max(1), height: height.max(1) },
+    );
+    Ok(())
+}
+
+fn arm_pin_wait(app: &AppHandle, label: &str) -> PinWait {
+    let (tx, rx) = std::sync::mpsc::channel();
+    pin_lock(&pin_signals()).insert(label.to_string(), tx);
+    let timeout_app = app.clone();
+    let timeout_label = label.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(PIN_REVEAL_FALLBACK);
+        let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
+    });
+    PinWait { rx }
+}
+
+fn take_spare(app: &AppHandle) -> Option<String> {
+    loop {
+        let label = pin_session::take_standby(app.state::<AppState>().inner())?;
+        if app.get_webview_window(&label).is_some() {
+            return Some(label);
+        }
+        pin_session::forget(app.state::<AppState>().inner(), &label);
+    }
+}
+
 pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<PinWait, String> {
-    let reused = take_standby(app);
+    let width = width.max(1);
+    let height = height.max(1);
+    let reused = take_spare(app);
     // A warmed window already has its label. The picture id has to be that label,
     // or hiding and switching groups cannot find the window.
     let id = match &reused {
         Some(label) => label.trim_start_matches("pin-").to_string(),
         None => new_id(),
     };
-    let state = app.state::<AppState>();
-    state.pins.lock().map_err(err)?.insert(id.clone(), path);
-    let group = *state.pin_group.lock().map_err(err)?;
-    state.pin_groups.lock().map_err(err)?.insert(id.clone(), group);
-    if let Ok(mut hidden) = state.pins_hidden.lock() {
-        *hidden = false;
+    let label = reused.clone().unwrap_or_else(|| format!("pin-{id}"));
+    remember_pin(app, &label, &path, x, y, width, height)?;
+    let wait = arm_pin_wait(app, &label);
+    if reused.is_some() {
+        hand_pin(app, label, id, path, x, y, width, height)?;
+    } else {
+        open_fresh_pin(app, label, id, x, y, width, height)?;
     }
-    if let Some(label) = reused {
-        return assign_standby(app, label, id, x, y, width, height);
-    }
-    let width = width.max(1);
-    let height = height.max(1);
-    let label = format!("pin-{id}");
-    // x/y/w/h stay the picture's cut. The window is larger so the edge light
-    // is drawn in the transparent margin and the pixels stay on the selection.
-    let frame_x = x - PIN_GLOW;
-    let frame_y = y - PIN_GLOW;
-    let frame_w = width.saturating_add((PIN_GLOW as u32).saturating_mul(2));
-    let frame_h = height.saturating_add((PIN_GLOW as u32).saturating_mul(2));
-    let query = format!("view=pin&id={id}&x={x}&y={y}&w={width}&h={height}");
+    replenish_pin(app);
+    Ok(wait)
+}
+
+fn hand_pin(app: &AppHandle, label: String, id: String, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    crate::util::trace("pin: reuse standby");
+    eprintln!("pin: reuse {label} as {id} at {x},{y} size {width}x{height}");
+    let frame = pin_frame(x, y, width, height);
+    let payload = PinAssign { id, path, x, y, width, height };
+    on_main(app, move |app| {
+        if let Some(window) = app.get_webview_window(&label) {
+            place_pin_window(app, &window, &label, frame);
+        }
+        let _ = app.emit_to(&label, "pin-assign", &payload);
+    })
+}
+
+fn open_fresh_pin(app: &AppHandle, label: String, id: String, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    let frame = pin_frame(x, y, width, height);
+    let query = format!("view=pin&id={id}");
     crate::util::trace("pin: window begin");
-    eprintln!("pin: open {label} at {x},{y} size {width}x{height} frame {frame_x},{frame_y} {frame_w}x{frame_h}");
-    let (tx, rx) = std::sync::mpsc::channel();
-    pin_lock(&pin_signals()).insert(label.clone(), tx);
-    let timeout_app = app.clone();
-    let timeout_label = label.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(PIN_REVEAL_FALLBACK);
-        let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
-    });
+    eprintln!("pin: open {label} at {x},{y} size {width}x{height} frame {},{} {}x{}", frame.x, frame.y, frame.width, frame.height);
     on_main(app, move |app| {
         let window = WebviewWindowBuilder::new(app, &label, view_url(&query))
             .title("Shotlet Pin")
@@ -861,7 +952,7 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
             .skip_taskbar(true)
             .focused(false)
             .visible(false)
-            .inner_size(frame_w as f64, frame_h as f64)
+            .inner_size(frame.width.max(1) as f64, frame.height.max(1) as f64)
             .min_inner_size(1.0, 1.0)
             .background_color(tauri::utils::config::Color(0, 0, 0, 0))
             .initialization_script(
@@ -875,101 +966,21 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
                 return;
             }
         };
-        if let Err(error) = window.set_position(PhysicalPosition::new(frame_x, frame_y)) {
-            eprintln!("pin: move window failed: {error}");
-        }
-        if let Err(error) = window.set_size(PhysicalSize::new(frame_w, frame_h)) {
-            eprintln!("pin: size window failed: {error}");
-        }
-        // Set both again. macOS sometimes applies the first size before the
-        // window has a screen, which leaves the sticker a few pixels off.
-        if let Err(error) = window.set_position(PhysicalPosition::new(frame_x, frame_y)) {
-            eprintln!("pin: move window failed: {error}");
-        }
-        if let Err(error) = window.set_size(PhysicalSize::new(frame_w, frame_h)) {
-            eprintln!("pin: size window failed: {error}");
-        }
-        if let Err(error) = window.set_always_on_top(true) {
-            eprintln!("pin: always-on-top failed: {error}");
-        }
-        // Composite while invisible. Showing an empty webview, or focusing it
-        // over the frozen capture, paints one blank frame.
+        place_pin_window(app, &window, &label, frame);
         cloak_pin(&window);
         crate::util::trace("pin: window cloaked");
-    })?;
-    // The next pin should not pay for creating a window. Build one now, hidden,
-    // so it is loaded by the time the next sticker is asked for.
-    replenish_pin(app);
-    Ok(PinWait { rx })
+    })
 }
 
-/// Hand a picture to a window that was built ahead of time.
-fn assign_standby(app: &AppHandle, label: String, id: String, x: i32, y: i32, width: u32, height: u32) -> Result<PinWait, String> {
-    let width = width.max(1);
-    let height = height.max(1);
-    crate::util::trace("pin: reuse standby");
-    eprintln!("pin: reuse {label} as {id} at {x},{y} size {width}x{height}");
-    let (tx, rx) = std::sync::mpsc::channel();
-    pin_lock(&pin_signals()).insert(label.clone(), tx);
-    let timeout_app = app.clone();
-    let timeout_label = label.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(PIN_REVEAL_FALLBACK);
-        let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
-    });
-    let path = path_of(app, &id);
-    let payload = PinAssign { id, path, x, y, width, height };
-    app.emit_to(&label, "pin-assign", &payload).map_err(err)?;
-    replenish_pin(app);
-    Ok(PinWait { rx })
-}
-
-fn path_of(app: &AppHandle, id: &str) -> String {
-    app.state::<AppState>()
-        .pins
-        .lock()
-        .ok()
-        .and_then(|pins| pins.get(id).cloned())
-        .unwrap_or_default()
-}
-
-/// The warmed page has registered its listener. It may be used from now on.
-pub fn note_pin_standby(app: &AppHandle, label: &str) {
-    if !label.starts_with("pin-") {
-        return;
-    }
-    let id = label.trim_start_matches("pin-");
-    let assigned = app
-        .state::<AppState>()
-        .pin_groups
-        .lock()
-        .ok()
-        .is_some_and(|groups| groups.contains_key(id));
-    if assigned {
-        return;
-    }
-    pin_lock(&pin_standby()).push(label.to_string());
-    crate::util::trace("pin: standby ready");
-}
-
-fn take_standby(app: &AppHandle) -> Option<String> {
-    let mut standby = pin_lock(&pin_standby());
-    while let Some(label) = standby.pop() {
-        if app.get_webview_window(&label).is_some() {
-            return Some(label);
-        }
-    }
-    None
-}
 
 /// Build one hidden pin window. It carries no picture until a pin reuses it.
 pub fn replenish_pin(app: &AppHandle) {
-    if !pin_lock(&pin_standby()).is_empty() {
+    if !pin_session::needs_spare(app.state::<AppState>().inner()) {
         return;
     }
     let app = app.clone();
     let _ = on_main(&app, |app| {
-        if !pin_lock(&pin_standby()).is_empty() {
+        if !pin_session::needs_spare(app.state::<AppState>().inner()) {
             return;
         }
         let label = format!("pin-{}", new_id());
@@ -991,6 +1002,7 @@ pub fn replenish_pin(app: &AppHandle) {
             )
             .build();
         if let Ok(window) = window {
+            pin_session::warm(app.state::<AppState>().inner(), &label);
             cloak_pin(&window);
             crate::util::trace("pin: standby built");
         }
@@ -1009,25 +1021,47 @@ struct PinAssign {
 }
 
 fn abandon_pin(label: &str, error: String) {
-    if !claim_pin_reveal(label) {
-        return;
-    }
     eprintln!("pin: create window failed: {error}");
     signal_pin(label, Err(error));
 }
 
-fn reveal_pin(app: &AppHandle, label: &str) {
-    if pin_lock(&pin_revealed()).contains(label) {
+fn trace_pin_rect(label: &str, window: &WebviewWindow, expected: Option<PinFrame>) {
+    let Ok(pos) = window.outer_position() else {
         return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let Some(expected) = expected else {
+        return;
+    };
+    crate::util::trace(&format!(
+        "pin: rect expected {},{} {}x{} actual {},{} {}x{}",
+        expected.x, expected.y, expected.width, expected.height, pos.x, pos.y, size.width, size.height
+    ));
+    let off = (pos.x - expected.x).abs() > 1
+        || (pos.y - expected.y).abs() > 1
+        || (size.width as i32 - expected.width).abs() > 1
+        || (size.height as i32 - expected.height).abs() > 1;
+    if off {
+        eprintln!(
+            "pin: window rect mismatch {label} expected {},{} {}x{} actual {},{} {}x{}",
+            expected.x, expected.y, expected.width, expected.height, pos.x, pos.y, size.width, size.height
+        );
     }
-    // The fallback timer can run before the window exists. Leave the claim
-    // open so the painted page can still reveal it.
+}
+
+fn reveal_pin(app: &AppHandle, label: &str) {
+    // The fallback timer can run before the window exists. Leave the slot
+    // assigned so the painted page can still reveal it.
     let Some(window) = app.get_webview_window(label) else {
         return;
     };
-    if !claim_pin_reveal(label) {
+    if !pin_session::mark_shown(app.state::<AppState>().inner(), label) {
         return;
     }
+    let expected = pin_session::frame_of(app.state::<AppState>().inner(), label);
+    trace_pin_rect(label, &window, expected);
     uncloak_pin(&window);
     if let Err(error) = window.show() {
         eprintln!("pin: show window failed: {error}");
@@ -1191,7 +1225,7 @@ pub fn toggle_pins(app: &AppHandle) {
         *flag
     };
     let group = state.pin_group.lock().map(|value| *value).unwrap_or(0);
-    let groups = state.pin_groups.lock().map(|value| value.clone()).unwrap_or_default();
+    let groups = pin_session::groups(state.inner());
     let app = app.clone();
     let _ = on_main(&app, move |app| {
         set_pin_visibility(app, group, &groups, !hidden);
@@ -1212,7 +1246,7 @@ pub fn switch_pin_group(app: &AppHandle) {
     if let Ok(mut hidden) = state.pins_hidden.lock() {
         *hidden = false;
     }
-    let groups = state.pin_groups.lock().map(|value| value.clone()).unwrap_or_default();
+    let groups = pin_session::groups(state.inner());
     let app = app.clone();
     let _ = on_main(&app, move |app| {
         set_pin_visibility(app, next, &groups, true);

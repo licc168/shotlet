@@ -119,11 +119,44 @@ pub fn prepare_access() {
     capture::prepare_capture_access();
 }
 
+/// Bitmap pixels of a selection, turned into the monitor's desktop rectangle.
+/// `point_width / bitmap_width` is the scale. Pin, record, and scroll share this.
+pub fn desktop_rect(
+    screen_x: i32,
+    screen_y: i32,
+    local_x: i32,
+    local_y: i32,
+    local_w: u32,
+    local_h: u32,
+    bitmap_w: u32,
+    bitmap_h: u32,
+    point_w: u32,
+    point_h: u32,
+) -> (i32, i32, u32, u32) {
+    let local_x = local_x.max(0) as u32;
+    let local_y = local_y.max(0) as u32;
+    let point_w = if point_w == 0 { bitmap_w } else { point_w };
+    let point_h = if point_h == 0 { bitmap_h } else { point_h };
+    (
+        screen_x.saturating_add(scale_len(local_x, bitmap_w, point_w) as i32),
+        screen_y.saturating_add(scale_len(local_y, bitmap_h, point_h) as i32),
+        scale_len(local_w, bitmap_w, point_w).max(1),
+        scale_len(local_h, bitmap_h, point_h).max(1),
+    )
+}
+
+fn scale_len(value: u32, from: u32, to: u32) -> u32 {
+    if from == 0 || to == 0 || from == to {
+        return value;
+    }
+    ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from)) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::{append_screens, arm_follow, begin, grab, is_current, stage};
+    use super::{append_screens, arm_follow, begin, desktop_rect, grab, is_current, stage};
     use crate::capture::ScreenImage;
     use crate::capture::{FrozenCapture, PresetRect};
     use crate::settings::Settings;
@@ -223,6 +256,12 @@ mod tests {
         assert_eq!(from, 0);
         assert_eq!(frozen.screens.len(), 1);
         assert_eq!(frozen.screens[0].path, "other");
+    }
+
+    #[test]
+    fn desktop_rect_scales_bitmap_pixels_into_the_monitor_slot() {
+        assert_eq!(desktop_rect(1920, 0, 100, 50, 200, 100, 2000, 1000, 1000, 500), (1970, 25, 100, 50));
+        assert_eq!(desktop_rect(-1920, 10, 0, 0, 40, 40, 800, 600, 0, 0), (-1920, 10, 40, 40));
     }
 
     #[test]

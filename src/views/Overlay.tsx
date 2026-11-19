@@ -240,7 +240,20 @@ export function Overlay() {
     const w = Math.max(1, Math.round(Math.min(region.w, shot.naturalWidth - x)));
     const h = Math.max(1, Math.round(Math.min(region.h, shot.naturalHeight - y)));
     try {
-      await pinCaptureRegion(screen.x + x, screen.y + y, w, h, screen.screenX + x, screen.screenY + y);
+      await pinCaptureRegion(
+        screen.x + x,
+        screen.y + y,
+        w,
+        h,
+        screen.screenX,
+        screen.screenY,
+        x,
+        y,
+        shot.naturalWidth,
+        shot.naturalHeight,
+        screen.pointWidth || shot.naturalWidth,
+        screen.pointHeight || shot.naturalHeight,
+      );
       await cancelCapture();
       return true;
     } catch (reason: unknown) {
@@ -427,7 +440,18 @@ export function Overlay() {
           onPlainCopy={(region) => finishCopy(region)}
           onPlainPin={(region) => finishPin(region)}
           onRecord={() => {
-            void openRecording(screen.screenX + selection.x, screen.screenY + selection.y, selection.w, selection.h).catch((reason: unknown) => {
+            void openRecording(
+              screen.screenX,
+              screen.screenY,
+              selection.x,
+              selection.y,
+              selection.w,
+              selection.h,
+              image.naturalWidth,
+              image.naturalHeight,
+              screen.pointWidth || image.naturalWidth,
+              screen.pointHeight || image.naturalHeight,
+            ).catch((reason: unknown) => {
               setError(reason instanceof Error ? reason.message : String(reason));
             });
           }}
@@ -439,14 +463,22 @@ export function Overlay() {
             }
             let ocrText = "";
             if (action === "ocr") ocrText = await ocrPngBase64(png);
-            const pinAt = action === "pin"
-              ? {
-                  x: Math.round(screen.screenX + selection.x),
-                  y: Math.round(screen.screenY + selection.y),
-                }
-              : null;
-            if (pinAt) {
-              await pinAnnotated(png, base, JSON.stringify(layers), pinAt.x, pinAt.y);
+            if (action === "pin") {
+              await pinAnnotated(
+                png,
+                base,
+                JSON.stringify(layers),
+                screen.screenX,
+                screen.screenY,
+                selection.x,
+                selection.y,
+                selection.w,
+                selection.h,
+                image.naturalWidth,
+                image.naturalHeight,
+                screen.pointWidth || image.naturalWidth,
+                screen.pointHeight || image.naturalHeight,
+              );
               await cancelCapture();
               return "";
             }

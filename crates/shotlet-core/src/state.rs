@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 
@@ -30,8 +29,7 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     pub capture: Mutex<Option<FrozenCapture>>,
     pub editor: Mutex<Option<EditorSession>>,
-    pub pins: Mutex<HashMap<String, String>>,
-    pub pin_groups: Mutex<HashMap<String, u8>>,
+    pub pins: Mutex<crate::pin_session::PinBook>,
     pub pin_group: Mutex<u8>,
     pub pins_hidden: Mutex<bool>,
     pub recorder: Mutex<Option<Recorder>>,
@@ -52,8 +50,7 @@ impl AppState {
             settings: Mutex::new(settings),
             capture: Mutex::new(None),
             editor: Mutex::new(None),
-            pins: Mutex::new(HashMap::new()),
-            pin_groups: Mutex::new(HashMap::new()),
+            pins: Mutex::new(crate::pin_session::PinBook::default()),
             pin_group: Mutex::new(0),
             pins_hidden: Mutex::new(false),
             recorder: Mutex::new(None),

@@ -48,13 +48,15 @@ src-tauri（窗口、托盘、全局快捷键、IPC）
 
 贴图时，没有标注的选区由 `library::pin_capture_region` 直接从内存缓存裁出并写贴图文件，不经过 canvas 和 base64。有标注的选区由 `library::pin_annotated` 把 PNG 字节原样落盘，宽高从文件头读。两条路的历史记录都在后台线程写，窗口不等它。
 
-启动后壳层预建一个隐藏的贴图窗口。页面加载完向壳层报到，贴图时优先把路径和位置发给这个窗口，用掉后再补建一个。没有报到的备用窗口时仍新建。隐藏和切换贴图组都跳过还没分配图片的备用窗口。
+贴图窗口的位置和大小只由壳层决定。`pin_session` 记下每个窗口是在预热、待命、已分配还是已显示。页面重复报到不会把同一个窗口再放进待命。壳层先摆好窗口，再发 `pin-assign`。页面只画图。滚轮缩放走 `pin_zoom`，按原图尺寸一次摆到当前中心。位图像素换成桌面坐标用 `capture_session::desktop_rect`，贴图、录制和滚动截图共用。
+
+启动后壳层预建一个隐藏的贴图窗口。页面加载完报到一次。没有待命窗口时仍新建。隐藏和切换贴图组跳过还没分配图片的窗口。窗口销毁时从 `pin_session` 删掉。
 
 窗口列表和写冻结文件跟在抓屏机制里，不单开一条壳层流程。壳层不计算打包坐标，也不保存第二份“这次截图还算不算数”。
 
 截图遮罩还在时，Esc 关掉这次截图。页面把这个键听在窗口上，不要求选区先被点中。壳层在遮罩显示期间再看一次这个键，窗口没拿到键盘焦点时也能关掉。
 
-`commands.rs` 只出现 `capture_session::`、`library::`、`scroll_session::`、`record_session::`。不出现 `history::`、`capture::`、`scroll::`、`record::`、`ocr::`、`util::`、`settings::`。
+`commands.rs` 只出现 `capture_session::`、`library::`、`scroll_session::`、`record_session::`、`pin_session::`。不出现 `history::`、`capture::`、`scroll::`、`record::`、`ocr::`、`util::`、`settings::`。
 
 ## 不搬过来的部分
 

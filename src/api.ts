@@ -273,16 +273,57 @@ export async function pinPngBase64(data: string, x: number, y: number): Promise<
   await call("pin_png_base64", { data, x, y });
 }
 
-export async function pinCaptureRegion(x: number, y: number, width: number, height: number, screenX: number, screenY: number): Promise<void> {
+export async function pinCaptureRegion(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  screenX: number,
+  screenY: number,
+  localX: number,
+  localY: number,
+  bitmapW: number,
+  bitmapH: number,
+  pointW: number,
+  pointH: number,
+): Promise<void> {
   tracePage("pin: plain click");
   if (!isTauri()) return;
-  await call("pin_capture_region", { x, y, width, height, screenX, screenY });
+  await call("pin_capture_region", { x, y, width, height, screenX, screenY, localX, localY, bitmapW, bitmapH, pointW, pointH });
 }
 
-export async function pinAnnotated(png: string, base: string, document: string, x: number, y: number): Promise<void> {
+export async function pinAnnotated(
+  png: string,
+  base: string,
+  document: string,
+  screenX: number,
+  screenY: number,
+  localX: number,
+  localY: number,
+  width: number,
+  height: number,
+  bitmapW: number,
+  bitmapH: number,
+  pointW: number,
+  pointH: number,
+): Promise<void> {
   tracePage("pin: annotated png");
-  if (!isTauri()) return pinPngBase64(png, x, y);
-  await call("pin_annotated", { png, base, document, x, y });
+  if (!isTauri()) return pinPngBase64(png, screenX + localX, screenY + localY);
+  await call("pin_annotated", {
+    png,
+    base,
+    document,
+    screenX,
+    screenY,
+    localX,
+    localY,
+    width,
+    height,
+    bitmapW,
+    bitmapH,
+    pointW,
+    pointH,
+  });
 }
 
 export async function pinFile(path: string, x: number, y: number): Promise<void> {
@@ -300,6 +341,12 @@ export async function pinStandby(): Promise<void> {
   if (!isTauri()) return;
   tracePage("pin: standby");
   await call("pin_standby");
+}
+
+/** Ask the shell to resize the pin around its current center. */
+export async function pinZoom(scale: number): Promise<void> {
+  if (!isTauri()) return;
+  await call("pin_zoom", { scale });
 }
 
 /** Tell the shell the sticker pixels are on the page, so it can reveal the window. */
@@ -403,12 +450,23 @@ export async function ffmpegAvailable(): Promise<boolean> {
 
 export type RecordAudio = "none" | "mic" | "speaker" | "both";
 
-export async function openRecording(x: number, y: number, width: number, height: number): Promise<void> {
+export async function openRecording(
+  screenX: number,
+  screenY: number,
+  localX: number,
+  localY: number,
+  width: number,
+  height: number,
+  bitmapW: number,
+  bitmapH: number,
+  pointW: number,
+  pointH: number,
+): Promise<void> {
   if (!isTauri()) {
     window.alert("区域录制需要桌面端。");
     return;
   }
-  await call("open_recording", { x, y, width, height });
+  await call("open_recording", { screenX, screenY, localX, localY, width, height, bitmapW, bitmapH, pointW, pointH });
 }
 
 export async function beginRecording(format: "gif" | "mp4", audio: RecordAudio, cursor: boolean): Promise<void> {

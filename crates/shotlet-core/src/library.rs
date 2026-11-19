@@ -241,13 +241,7 @@ pub fn pin_clipboard() -> Result<(PathBuf, i32, i32, u32, u32), String> {
 }
 
 pub fn pin_path(state: &AppState, id: &str) -> Result<String, String> {
-    state
-        .pins
-        .lock()
-        .map_err(err)?
-        .get(id)
-        .cloned()
-        .ok_or_else(|| "贴图已经失效".into())
+    crate::pin_session::file_path(state, id)
 }
 
 pub fn recognize_png(data: &str) -> Result<String, String> {

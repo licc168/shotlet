@@ -6,6 +6,7 @@
 pub mod capture_session;
 pub mod editor;
 pub mod library;
+pub mod pin_session;
 pub mod record_session;
 pub mod scroll_session;
 pub mod shortcut;
