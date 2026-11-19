@@ -21,21 +21,20 @@ fn err(error: impl ToString) -> String {
 pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
     let mode = mode.to_string();
     let epoch = capture_session::begin(&app.state::<AppState>());
-    ui::on_main_wait(&app, |app| {
-        ui::conceal_overlays(app);
-    })?;
+    let covered = ui::on_main_wait(&app, |app| ui::conceal_overlays(app))?;
     let mode_for_capture = mode.clone();
-    let frozen = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture))
+    let shot = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture, covered))
         .await
         .map_err(err)??;
     if !capture_session::is_current(&app.state::<AppState>(), epoch) {
         return Ok(());
     }
+    let later = shot.later;
     let mode_for_stage = mode;
     let app_for_window = app.clone();
     app.run_on_main_thread(move || {
         let state = app_for_window.state::<AppState>();
-        let staged = match capture_session::stage(&state, epoch, frozen, &mode_for_stage) {
+        let staged = match capture_session::stage(&state, epoch, shot.frozen, &mode_for_stage) {
             Ok(Some(staged)) => staged,
             Ok(None) => return,
             Err(error) => {
@@ -48,6 +47,30 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
             return;
         }
         capture_session::arm_follow(&state, staged.follow);
+        let Some(cursor) = staged.frozen.screens.first().cloned() else {
+            return;
+        };
+        if later.is_empty() {
+            return;
+        }
+        let generation = staged.generation;
+        let app_later = app_for_window.clone();
+        tauri::async_runtime::spawn(async move {
+            let added = tauri::async_runtime::spawn_blocking(move || capture_session::capture_remaining(&cursor, &later))
+                .await
+                .unwrap_or_default();
+            if added.is_empty() {
+                return;
+            }
+            let _ = app_later.clone().run_on_main_thread(move || {
+                let Some((frozen, from)) = capture_session::append_screens(&app_later.state::<AppState>(), epoch, generation, added) else {
+                    return;
+                };
+                if let Err(error) = ui::present_more_overlays(&app_later, &frozen, generation, from) {
+                    let _ = app_later.emit("capture-error", error);
+                }
+            });
+        });
     })
     .map_err(err)
 }
@@ -363,7 +386,8 @@ pub fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<(), Stri
     let y = round_i32(y);
     let (width, height) = library::image_size(Path::new(&path))?;
     eprintln!("pin: file {path} at {x},{y} ({width}x{height})");
-    ui::open_pin(&app, path, x, y, width, height)
+    let _ = ui::open_pin(&app, path, x, y, width, height)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -377,8 +401,9 @@ pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Res
         .await
         .map_err(err)??;
     eprintln!("pin: wrote {} ({width}x{height})", path.display());
-    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?;
-    eprintln!("pin: window queued");
+    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?
+        .ready()
+        .await?;
     Ok(())
 }
 
@@ -392,9 +417,16 @@ pub fn copy_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u
 pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
     let (path, x, y, width, height) = tauri::async_runtime::spawn_blocking(library::pin_clipboard).await.map_err(err)??;
     eprintln!("pin: clipboard {} at {x},{y} ({width}x{height})", path.display());
-    ui::open_pin(app, path.to_string_lossy().to_string(), x, y, width, height)?;
+    ui::open_pin(app, path.to_string_lossy().to_string(), x, y, width, height)?
+        .ready()
+        .await?;
     let _ = app.emit("capture-error", "已贴图");
     Ok(())
+}
+
+#[tauri::command]
+pub fn pin_ready(window: tauri::WebviewWindow) {
+    ui::present_pin(window.app_handle(), window.label());
 }
 
 #[tauri::command]

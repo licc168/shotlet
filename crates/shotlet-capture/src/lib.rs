@@ -1,7 +1,7 @@
 mod windows_list;
 
 use image::{imageops, RgbaImage};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use xcap::Monitor;
@@ -128,29 +128,72 @@ fn intersects_local(x: i32, y: i32, w: i32, h: i32, width: i32, height: i32) -> 
 
 fn cached_screen(path: &str) -> Result<Arc<RgbaImage>, String> {
     if let Ok(slot) = preview_cache().lock() {
-        if let Some(image) = slot.get(path) {
+        if let Some(image) = slot.images.get(path) {
             return Ok(Arc::clone(image));
         }
     }
     Ok(Arc::new(shotlet_platform::read_png_file(std::path::Path::new(path))?))
 }
 
-fn preview_cache() -> &'static Mutex<HashMap<String, Arc<RgbaImage>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<RgbaImage>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+struct PreviewCache {
+    images: HashMap<String, Arc<RgbaImage>>,
+    order: VecDeque<String>,
+}
+
+fn preview_cache() -> &'static Mutex<PreviewCache> {
+    static CACHE: OnceLock<Mutex<PreviewCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(PreviewCache {
+            images: HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
+fn remember_preview(cache: &mut PreviewCache, key: String, image: Arc<RgbaImage>) {
+    if cache.images.insert(key.clone(), image).is_none() {
+        cache.order.push_back(key);
+    }
+    // The newest frames stay. Dropping one whose file is still being written only
+    // happens after several later shots, when that overlay is already gone.
+    while cache.order.len() > 6 {
+        if let Some(old) = cache.order.pop_front() {
+            cache.images.remove(&old);
+        }
+    }
 }
 
 /// Pixels kept from the last freeze so the overlay can paint without decoding a file.
 pub fn preview_bytes(path: &str) -> Result<Vec<u8>, String> {
     if let Ok(slot) = preview_cache().lock() {
-        if let Some(image) = slot.get(path) {
+        if let Some(image) = slot.images.get(path) {
             return Ok(image.as_raw().clone());
         }
     }
     Ok(shotlet_platform::read_png_file(std::path::Path::new(path))?.into_raw())
 }
 
-pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
+/// A display grabbed after the monitor under the cursor is already on screen.
+#[derive(Clone)]
+pub struct LaterMonitor {
+    pub device_x: i32,
+    pub device_y: i32,
+    pub slot: MonitorRect,
+}
+
+pub struct FreezeShot {
+    pub frozen: FrozenCapture,
+    pub later: Vec<LaterMonitor>,
+}
+
+struct PreparedMonitor {
+    monitor: Monitor,
+    device_x: i32,
+    device_y: i32,
+    slot: MonitorRect,
+}
+
+pub fn freeze_under_cursor() -> Result<FreezeShot, String> {
     ensure_screen_capture()?;
     let (cursor_x, cursor_y) = cursor_point().ok_or("无法读取鼠标位置")?;
     let mut monitors = Monitor::all().map_err(err)?;
@@ -159,13 +202,10 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
     }
     monitors.sort_by_key(|monitor| (monitor.x().unwrap_or(i32::MAX), monitor.y().unwrap_or(i32::MAX)));
     let os_monitors = cursor_space_monitors();
-    let mut screens = Vec::new();
-    let mut packed_x: i32 = 0;
-    let mut chosen: Option<usize> = None;
-    let mut fresh = HashMap::new();
+    let mut prepared = Vec::new();
     for monitor in monitors {
-        let Ok(sx) = monitor.x() else { continue };
-        let Ok(sy) = monitor.y() else { continue };
+        let Ok(device_x) = monitor.x() else { continue };
+        let Ok(device_y) = monitor.y() else { continue };
         let Ok(point_w) = monitor.width() else { continue };
         let Ok(point_h) = monitor.height() else { continue };
         if point_w == 0 || point_h == 0 {
@@ -173,59 +213,130 @@ pub fn freeze_under_cursor() -> Result<FrozenCapture, String> {
         }
         let slot = cursor_space_for(
             &monitor.name().unwrap_or_default(),
-            MonitorRect { x: sx, y: sy, width: point_w, height: point_h },
+            MonitorRect { x: device_x, y: device_y, width: point_w, height: point_h },
             &os_monitors,
         );
-        let Ok(image) = monitor.capture_image() else { continue };
-        let width = image.width();
-        let height = image.height();
-        if width == 0 || height == 0 || width > 20000 || height > 20000 {
-            continue;
-        }
-        let path = capture_dir().join(format!("freeze-{}.shot", new_id()));
-        write_frozen(&path, &image)?;
-        let key = path.to_string_lossy().to_string();
-        fresh.insert(key.clone(), Arc::new(image));
-        // Window positions share the monitor's point space, which is not the packed crop origin.
-        let mut windows = windows_list::list_windows(slot.x, slot.y, slot.width as i32, slot.height as i32);
-        windows.retain(|window| intersects_local(window.x, window.y, window.width, window.height, slot.width as i32, slot.height as i32));
-        scale_windows_to_image(&mut windows, slot.width, slot.height, width, height);
-        if cursor_x >= slot.x && cursor_y >= slot.y && cursor_x < slot.x + slot.width as i32 && cursor_y < slot.y + slot.height as i32 {
-            chosen = Some(screens.len());
-        }
-        screens.push(ScreenImage {
-            x: packed_x,
-            y: 0,
-            width,
-            height,
-            point_width: slot.width,
-            point_height: slot.height,
-            path: key,
-            screen_x: slot.x,
-            screen_y: slot.y,
-            windows,
-        });
-        packed_x = packed_x.saturating_add(width as i32);
+        prepared.push(PreparedMonitor { monitor, device_x, device_y, slot });
     }
-    if screens.is_empty() {
+    if prepared.is_empty() {
         return Err("没有找到显示器".into());
     }
-    if let Ok(mut slot) = preview_cache().lock() {
-        *slot = fresh;
+    let mut order: Vec<usize> = (0..prepared.len()).collect();
+    if let Some(pos) = order.iter().position(|&index| hit_slot(prepared[index].slot, cursor_x, cursor_y)) {
+        let index = order.remove(pos);
+        order.insert(0, index);
     }
-    let primary = screens[chosen.unwrap_or(0)].clone();
-    Ok(FrozenCapture {
-        path: primary.path.clone(),
-        width: primary.width,
-        height: primary.height,
-        origin_x: primary.screen_x,
-        origin_y: primary.screen_y,
-        windows: primary.windows.clone(),
-        mode: shotlet_types::default_mode(),
-        preset: None,
-        screens,
-        generation: 0,
+    let mut primary = None;
+    let mut later = Vec::new();
+    for index in order {
+        let item = &prepared[index];
+        if primary.is_none() {
+            if let Some(screen) = capture_published(&item.monitor, item.slot, 0) {
+                primary = Some(screen);
+                continue;
+            }
+        }
+        later.push(LaterMonitor {
+            device_x: item.device_x,
+            device_y: item.device_y,
+            slot: item.slot,
+        });
+    }
+    let Some(primary) = primary else {
+        return Err("没有找到显示器".into());
+    };
+    later.sort_by_key(|item| (item.slot.x, item.slot.y));
+    Ok(FreezeShot {
+        frozen: FrozenCapture {
+            path: primary.path.clone(),
+            width: primary.width,
+            height: primary.height,
+            origin_x: primary.screen_x,
+            origin_y: primary.screen_y,
+            windows: primary.windows.clone(),
+            mode: shotlet_types::default_mode(),
+            preset: None,
+            screens: vec![primary],
+            generation: 0,
+        },
+        later,
     })
+}
+
+pub fn capture_later(pending: &[LaterMonitor], mut packed_x: i32) -> Vec<ScreenImage> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let Ok(monitors) = Monitor::all() else {
+        return Vec::new();
+    };
+    let mut screens = Vec::new();
+    for item in pending {
+        let Some(monitor) = monitors.iter().find(|monitor| monitor.x().ok() == Some(item.device_x) && monitor.y().ok() == Some(item.device_y)) else {
+            continue;
+        };
+        let Some(screen) = capture_published(monitor, item.slot, packed_x) else {
+            continue;
+        };
+        packed_x = packed_x.saturating_add(screen.width as i32);
+        screens.push(screen);
+    }
+    screens
+}
+
+fn hit_slot(slot: MonitorRect, x: i32, y: i32) -> bool {
+    x >= slot.x && y >= slot.y && x < slot.x + slot.width as i32 && y < slot.y + slot.height as i32
+}
+
+fn capture_published(monitor: &Monitor, slot: MonitorRect, packed_x: i32) -> Option<ScreenImage> {
+    let windows_job = spawn_window_list(slot);
+    let captured = monitor.capture_image();
+    let mut windows = windows_job.join().unwrap_or_default();
+    let image = captured.ok()?;
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 || width > 20000 || height > 20000 {
+        return None;
+    }
+    // Window positions share the monitor's point space, which is not the packed crop origin.
+    scale_windows_to_image(&mut windows, slot.width, slot.height, width, height);
+    let path = publish_image(image);
+    Some(ScreenImage {
+        x: packed_x,
+        y: 0,
+        width,
+        height,
+        point_width: slot.width,
+        point_height: slot.height,
+        path,
+        screen_x: slot.x,
+        screen_y: slot.y,
+        windows,
+    })
+}
+
+fn spawn_window_list(slot: MonitorRect) -> std::thread::JoinHandle<Vec<WindowInfo>> {
+    std::thread::spawn(move || {
+        let mut windows = windows_list::list_windows(slot.x, slot.y, slot.width as i32, slot.height as i32);
+        windows.retain(|window| intersects_local(window.x, window.y, window.width, window.height, slot.width as i32, slot.height as i32));
+        windows
+    })
+}
+
+/// Keep the pixels in memory and write the file after the overlay is up.
+/// Scanning a new file can take as long as the capture itself.
+fn publish_image(image: RgbaImage) -> String {
+    let path = capture_dir().join(format!("freeze-{}.shot", new_id()));
+    let key = path.to_string_lossy().to_string();
+    let image = Arc::new(image);
+    if let Ok(mut cache) = preview_cache().lock() {
+        remember_preview(&mut cache, key.clone(), Arc::clone(&image));
+    }
+    let writing = Arc::clone(&image);
+    std::thread::spawn(move || {
+        let _ = write_frozen(&path, &writing);
+    });
+    key
 }
 
 pub fn crop_screens(screens: &[ScreenImage], x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage, String> {
@@ -448,10 +559,11 @@ mod tests {
     #[test]
     fn preview_returns_the_captured_pixels() {
         let image = RgbaImage::from_pixel(2, 1, Rgba([9, 8, 7, 255]));
-        super::preview_cache()
-            .lock()
-            .unwrap()
-            .insert("memory-shot".into(), std::sync::Arc::new(image.clone()));
+        super::remember_preview(
+            &mut super::preview_cache().lock().unwrap(),
+            "memory-shot".into(),
+            std::sync::Arc::new(image.clone()),
+        );
         assert_eq!(super::preview_bytes("memory-shot").unwrap().as_slice(), image.as_raw().as_slice());
     }
 
@@ -459,10 +571,11 @@ mod tests {
     fn crop_reads_the_preview_cache_instead_of_disk() {
         use shotlet_types::ScreenImage;
         let image = RgbaImage::from_fn(4, 3, |x, y| Rgba([x as u8, y as u8, 9, 255]));
-        super::preview_cache()
-            .lock()
-            .unwrap()
-            .insert("cached-crop".into(), std::sync::Arc::new(image));
+        super::remember_preview(
+            &mut super::preview_cache().lock().unwrap(),
+            "cached-crop".into(),
+            std::sync::Arc::new(image),
+        );
         let screens = vec![ScreenImage {
             x: 10,
             y: 0,

@@ -5,7 +5,7 @@ use crate::capture;
 use crate::state::AppState;
 use crate::util::err;
 
-pub use crate::capture::FrozenCapture;
+pub use crate::capture::{FreezeShot, FrozenCapture, LaterMonitor, ScreenImage};
 
 pub struct StagedCapture {
     pub frozen: FrozenCapture,
@@ -23,19 +23,45 @@ pub fn is_current(state: &AppState, epoch: u64) -> bool {
 }
 
 /// Freeze the desktop after the shell has hidden the overlay.
-pub fn grab(mode: &str) -> Result<FrozenCapture, String> {
-    // The previous overlay must leave the screen before the pixels are frozen.
-    std::thread::sleep(Duration::from_millis(60));
-    let mut frozen = capture::freeze_under_cursor()?;
-    match mode {
-        "copy" => frozen.mode = "copy".into(),
-        "window" => {
-            frozen.preset = capture::window_under_cursor(frozen.origin_x, frozen.origin_y, &frozen.windows);
-            frozen.mode = "edit".into();
-        }
-        _ => frozen.mode = "edit".into(),
+/// `wait_for_hide` is set only when an overlay was actually on screen.
+pub fn grab(mode: &str, wait_for_hide: bool) -> Result<FreezeShot, String> {
+    if wait_for_hide {
+        // The previous overlay must leave the screen before the pixels are frozen.
+        std::thread::sleep(Duration::from_millis(60));
     }
-    Ok(frozen)
+    let mut shot = capture::freeze_under_cursor()?;
+    match mode {
+        "copy" => shot.frozen.mode = "copy".into(),
+        "window" => {
+            shot.frozen.preset = capture::window_under_cursor(shot.frozen.origin_x, shot.frozen.origin_y, &shot.frozen.windows);
+            shot.frozen.mode = "edit".into();
+        }
+        _ => shot.frozen.mode = "edit".into(),
+    }
+    Ok(shot)
+}
+
+/// Grab the monitors left after the cursor screen. The packed origin continues
+/// after that screen; the shell does not place these pixels.
+pub fn capture_remaining(cursor: &ScreenImage, later: &[LaterMonitor]) -> Vec<ScreenImage> {
+    let packed = cursor.x.saturating_add(cursor.width as i32);
+    capture::capture_later(later, packed)
+}
+
+/// Add monitors that were grabbed after the cursor screen was shown.
+/// A newer F1 drops them.
+pub fn append_screens(state: &AppState, epoch: u64, generation: u64, extra: Vec<ScreenImage>) -> Option<(FrozenCapture, usize)> {
+    if extra.is_empty() || !is_current(state, epoch) {
+        return None;
+    }
+    let mut slot = state.capture.lock().map_err(err).ok()?;
+    let frozen = slot.as_mut()?;
+    if frozen.generation != generation {
+        return None;
+    }
+    let from = frozen.screens.len();
+    frozen.screens.extend(extra);
+    Some((frozen.clone(), from))
 }
 
 /// Accept the shot when this launch is still the latest one.
@@ -72,7 +98,8 @@ pub fn prepare_access() {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::{arm_follow, begin, grab, is_current, stage};
+    use super::{append_screens, arm_follow, begin, grab, is_current, stage};
+    use crate::capture::ScreenImage;
     use crate::capture::{FrozenCapture, PresetRect};
     use crate::settings::Settings;
     use crate::state::AppState;
@@ -139,20 +166,70 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_launch_drops_screens_from_the_previous_one() {
+        let state = state();
+        let epoch = begin(&state);
+        let Some(staged) = stage(&state, epoch, shot(None), "edit").unwrap() else {
+            panic!("stage dropped the current launch");
+        };
+        let newer = begin(&state);
+        let extra = vec![ScreenImage {
+            x: 10,
+            y: 0,
+            width: 2,
+            height: 2,
+            point_width: 2,
+            point_height: 2,
+            path: "other".into(),
+            screen_x: 10,
+            screen_y: 0,
+            windows: Vec::new(),
+        }];
+        assert!(append_screens(&state, epoch, staged.generation, extra.clone()).is_none());
+        assert!(is_current(&state, newer));
+        assert!(state.capture.lock().unwrap().as_ref().unwrap().screens.is_empty());
+
+        let Some(open) = stage(&state, newer, shot(None), "edit").unwrap() else {
+            panic!("stage dropped the current launch");
+        };
+        let Some((frozen, from)) = append_screens(&state, newer, open.generation, extra) else {
+            panic!("append dropped the current launch");
+        };
+        assert_eq!(from, 0);
+        assert_eq!(frozen.screens.len(), 1);
+        assert_eq!(frozen.screens[0].path, "other");
+    }
+
+    #[test]
     #[ignore = "captures the desktop"]
     fn grab_freezes_the_monitor_under_the_cursor() {
         for mode in ["edit", "copy", "window"] {
-            let frozen = grab(mode).unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let shot = grab(mode, false).unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let frozen = &shot.frozen;
             assert!(frozen.width >= 8 && frozen.height >= 8, "{mode} {}x{}", frozen.width, frozen.height);
             assert_eq!(frozen.mode, if mode == "copy" { "copy" } else { "edit" });
-            assert!(std::path::Path::new(&frozen.path).is_file(), "{mode} missing {}", frozen.path);
+            assert_eq!(frozen.screens.len(), 1, "{mode} should show the cursor screen first");
+            let cursor = &frozen.screens[0];
+            let extra = super::capture_remaining(cursor, &shot.later);
             if mode == "window" {
                 let found = frozen.preset.is_some();
                 eprintln!("window preset found: {found}");
             }
-            for screen in &frozen.screens {
+            for screen in frozen.screens.iter().chain(&extra) {
+                wait_frozen_file(&screen.path);
                 let _ = std::fs::remove_file(&screen.path);
             }
         }
+    }
+
+    fn wait_frozen_file(path: &str) {
+        let file = std::path::Path::new(path);
+        for _ in 0..100 {
+            if file.is_file() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("missing {path}");
     }
 }

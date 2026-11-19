@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -14,6 +15,11 @@ use crate::state::{AppState, OverlayPlace};
 use crate::util::{err, new_id};
 
 const OVERLAY: &str = "overlay";
+
+/// The overlay window is up. The page only hears Esc after that webview has keyboard
+/// focus, which a borderless show often does not get.
+static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
+static OVERLAY_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 pub fn view_url(query: &str) -> WebviewUrl {
     if cfg!(debug_assertions) {
@@ -89,6 +95,15 @@ pub fn open_home(app: &AppHandle) {
 struct OverlayShow {
     generation: u64,
     armed: bool,
+    /// Which overlay window this show belongs to. Every overlay page hears every emit.
+    slot: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayArm {
+    slot: usize,
+    armed: bool,
 }
 
 fn overlay_label(index: usize) -> String {
@@ -138,6 +153,19 @@ fn prepare_overlay_slot(app: &AppHandle, slot: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn place_of(screen: &capture::ScreenImage, index: usize, generation: u64) -> OverlayPlace {
+    OverlayPlace {
+        label: overlay_label(index),
+        x: screen.screen_x,
+        y: screen.screen_y,
+        width: screen.width,
+        height: screen.height,
+        point_width: if screen.point_width == 0 { screen.width } else { screen.point_width },
+        point_height: if screen.point_height == 0 { screen.height } else { screen.point_height },
+        generation,
+    }
+}
+
 fn places_for(frozen: &FrozenCapture, generation: u64) -> Vec<OverlayPlace> {
     if frozen.screens.is_empty() {
         return vec![OverlayPlace {
@@ -151,29 +179,22 @@ fn places_for(frozen: &FrozenCapture, generation: u64) -> Vec<OverlayPlace> {
             generation,
         }];
     }
-    frozen
-        .screens
-        .iter()
-        .enumerate()
-        .map(|(index, screen)| OverlayPlace {
-            label: overlay_label(index),
-            x: screen.screen_x,
-            y: screen.screen_y,
-            width: screen.width,
-            height: screen.height,
-            point_width: if screen.point_width == 0 { screen.width } else { screen.point_width },
-            point_height: if screen.point_height == 0 { screen.height } else { screen.point_height },
-            generation,
-        })
-        .collect()
+    frozen.screens.iter().enumerate().map(|(index, screen)| place_of(screen, index, generation)).collect()
 }
 
-pub fn conceal_overlays(app: &AppHandle) {
+/// Hides every overlay. Returns whether one was on screen, so the grab can wait
+/// for that window to leave the pixels.
+pub fn conceal_overlays(app: &AppHandle) -> bool {
+    let mut covered = false;
     for label in overlay_labels(app) {
         if let Some(window) = app.get_webview_window(&label) {
+            if window.is_visible().unwrap_or(false) {
+                covered = true;
+            }
             let _ = window.hide();
         }
     }
+    covered
 }
 
 pub fn present_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64) -> Result<(), String> {
@@ -191,19 +212,100 @@ pub fn present_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64
         }
     }
     hide_extra_overlays(app, places.len());
+    OVERLAY_OPEN.store(true, Ordering::Relaxed);
     let aim = (frozen.origin_x, frozen.origin_y);
-    for place in &places {
+    for (slot, place) in places.iter().enumerate() {
+        // Show before the page paints. A hidden WebView throttles the page, so the
+        // frozen pixels would sit for about a second after F1.
+        let _ = show_overlay_place(app, place, place.x == aim.0 && place.y == aim.1);
         app.emit_to(
             &place.label,
             "overlay-show",
             OverlayShow {
                 generation,
                 armed: place.x == aim.0 && place.y == aim.1,
+                slot,
             },
         )
         .map_err(err)?;
     }
+    note_overlay_hwnds(app);
     Ok(())
+}
+
+pub fn present_more_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64, from: usize) -> Result<(), String> {
+    if from >= frozen.screens.len() {
+        return Ok(());
+    }
+    let aim = (frozen.origin_x, frozen.origin_y);
+    let mut extra = Vec::new();
+    for index in from..frozen.screens.len() {
+        prepare_overlay_slot(app, index)?;
+        extra.push(place_of(&frozen.screens[index], index, generation));
+    }
+    {
+        let state = app.state::<AppState>();
+        let mut pending = state.overlay_pending.lock().map_err(err)?;
+        pending.extend(extra.iter().cloned());
+    }
+    for (offset, place) in extra.iter().enumerate() {
+        let _ = show_overlay_place(app, place, place.x == aim.0 && place.y == aim.1);
+        app.emit_to(
+            &place.label,
+            "overlay-show",
+            OverlayShow {
+                generation,
+                armed: place.x == aim.0 && place.y == aim.1,
+                slot: from + offset,
+            },
+        )
+        .map_err(err)?;
+    }
+    note_overlay_hwnds(app);
+    Ok(())
+}
+
+fn note_overlay_hwnds(app: &AppHandle) {
+    let mut keys = Vec::new();
+    #[cfg(windows)]
+    {
+        for label in overlay_labels(app) {
+            let Some(window) = app.get_webview_window(&label) else { continue };
+            if !window.is_visible().unwrap_or(false) {
+                continue;
+            }
+            if let Ok(hwnd) = window.hwnd() {
+                keys.push(hwnd.0 as isize);
+            }
+        }
+    }
+    if let Ok(mut slot) = OVERLAY_HWNDS.lock() {
+        *slot = keys;
+    }
+}
+
+fn overlay_has_foreground() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let foreground = unsafe { GetForegroundWindow() };
+        let raw = foreground.0 as isize;
+        if raw == 0 {
+            return false;
+        }
+        return OVERLAY_HWNDS.lock().map(|slot| slot.contains(&raw)).unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn show_overlay_place(app: &AppHandle, place: &OverlayPlace, focus: bool) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(&place.label) else {
+        return Ok(());
+    };
+    place_overlay_window(&window, place, focus)
 }
 
 pub fn reveal_overlay(window: &WebviewWindow, generation: u64) -> Result<(), String> {
@@ -263,7 +365,7 @@ fn rects_of(screens: &[capture::ScreenImage]) -> Vec<capture::MonitorRect> {
 fn emit_overlay_arm(app: &AppHandle, screens: &[capture::ScreenImage], key: (i32, i32)) {
     for (slot, screen) in screens.iter().enumerate() {
         let armed = screen.screen_x == key.0 && screen.screen_y == key.1;
-        let _ = app.emit_to(overlay_label(slot), "overlay-arm", armed);
+        let _ = app.emit_to(overlay_label(slot), "overlay-arm", OverlayArm { slot, armed });
     }
 }
 
@@ -450,12 +552,37 @@ pub fn begin_follow(app: &AppHandle) {
     std::thread::spawn(move || follow_loop(app));
 }
 
+fn escape_key_down() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+        return unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) } < 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn follow_loop(app: AppHandle) {
     static FOCUSING: AtomicBool = AtomicBool::new(false);
     let mut stable: Option<(i32, i32)> = None;
     let mut stable_hits = 0u8;
+    let mut escape_was_down = false;
     loop {
         std::thread::sleep(Duration::from_millis(40));
+        let escape_down = escape_key_down();
+        let escape_hit = escape_down && !escape_was_down;
+        escape_was_down = escape_down;
+        // The focused overlay page handles Esc itself, so a text field can take the first press.
+        // This path is for when the borderless window never became the foreground.
+        if escape_hit && OVERLAY_OPEN.load(Ordering::Relaxed) && !overlay_has_foreground() {
+            let app_for_close = app.clone();
+            let _ = app.run_on_main_thread(move || dismiss_overlay(&app_for_close));
+            stable = None;
+            stable_hits = 0;
+            continue;
+        }
         let state = app.state::<AppState>();
         if !state.overlay_follow.load(Ordering::Relaxed) {
             stable = None;
@@ -547,6 +674,10 @@ pub fn close_overlay(app: &AppHandle) {
 }
 
 fn dismiss_overlay(app: &AppHandle) {
+    OVERLAY_OPEN.store(false, Ordering::Relaxed);
+    if let Ok(mut slot) = OVERLAY_HWNDS.lock() {
+        slot.clear();
+    }
     if let Some(state) = app.try_state::<AppState>() {
         state.overlay_follow.store(false, Ordering::Relaxed);
         state.overlay_epoch.fetch_add(1, Ordering::Relaxed);
@@ -615,8 +746,67 @@ pub fn open_editor(app: &AppHandle) -> Result<(), String> {
 
 /// Physical pixels of transparent margin around a pin. Must match `PIN_GLOW` in src/lib/pin.ts.
 const PIN_GLOW: i32 = 22;
+/// Safety reveal if the page never reports that the picture is painted.
+const PIN_REVEAL_FALLBACK: Duration = Duration::from_secs(8);
+const PIN_REVEAL_WAIT: Duration = Duration::from_secs(12);
 
-pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+fn pin_signals() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>> {
+    static SIGNALS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<Result<(), String>>>>> = OnceLock::new();
+    SIGNALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pin_revealed() -> &'static Mutex<HashSet<String>> {
+    static REVEALED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    REVEALED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn pin_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn claim_pin_reveal(label: &str) -> bool {
+    pin_lock(&pin_revealed()).insert(label.to_string())
+}
+
+fn signal_pin(label: &str, result: Result<(), String>) {
+    if let Some(sender) = pin_lock(&pin_signals()).remove(label) {
+        let _ = sender.send(result);
+    }
+}
+
+/// The caller can wait until the sticker is actually on screen.
+/// Dropping it does not cancel the window.
+#[must_use]
+pub struct PinWait {
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+}
+
+impl PinWait {
+    pub fn wait(self) -> Result<(), String> {
+        match self.rx.recv_timeout(PIN_REVEAL_WAIT) {
+            Ok(result) => result,
+            Err(_) => Err("贴图没有出现".into()),
+        }
+    }
+
+    pub async fn ready(self) -> Result<(), String> {
+        tauri::async_runtime::spawn_blocking(move || self.wait())
+            .await
+            .map_err(err)?
+    }
+}
+
+/// Show the sticker only after its page has painted. Until then the window
+/// stays cloaked, and the capture layer stays up, so neither a blank webview
+/// nor the desktop flashes through the selection.
+pub fn present_pin(app: &AppHandle, label: &str) {
+    if !label.starts_with("pin-") {
+        return;
+    }
+    reveal_pin(app, label);
+}
+
+pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, height: u32) -> Result<PinWait, String> {
     let id = new_id();
     let state = app.state::<AppState>();
     state.pins.lock().map_err(err)?.insert(id.clone(), path);
@@ -636,6 +826,14 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
     let frame_h = height.saturating_add((PIN_GLOW as u32).saturating_mul(2));
     let query = format!("view=pin&id={id}&x={x}&y={y}&w={width}&h={height}");
     eprintln!("pin: open {label} at {x},{y} size {width}x{height} frame {frame_x},{frame_y} {frame_w}x{frame_h}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    pin_lock(&pin_signals()).insert(label.clone(), tx);
+    let timeout_app = app.clone();
+    let timeout_label = label.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PIN_REVEAL_FALLBACK);
+        let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
+    });
     on_main(app, move |app| {
         let window = WebviewWindowBuilder::new(app, &label, view_url(&query))
             .title("Shotlet Pin")
@@ -645,27 +843,19 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
             .transparent(true)
             .shadow(false)
             .skip_taskbar(true)
-            .focused(true)
+            .focused(false)
             .visible(false)
             .inner_size(frame_w as f64, frame_h as f64)
             .min_inner_size(1.0, 1.0)
             .background_color(tauri::utils::config::Color(0, 0, 0, 0))
             .initialization_script(
-                "document.documentElement.dataset.view='pin';document.documentElement.style.background='transparent';document.addEventListener('DOMContentLoaded',function(){document.body.style.margin='0';document.body.style.background='transparent';});",
+                "document.documentElement.dataset.view='pin';document.documentElement.style.background='transparent';var clearPin=function(){if(!document.body)return;document.body.style.margin='0';document.body.style.background='transparent';var root=document.getElementById('root');if(root)root.style.background='transparent';};clearPin();document.addEventListener('DOMContentLoaded',clearPin);",
             )
-            .on_page_load(|window, payload| {
-                if !matches!(payload.event(), PageLoadEvent::Finished) {
-                    return;
-                }
-                let _ = window.show();
-                let _ = window.set_always_on_top(true);
-                let _ = window.set_focus();
-            })
             .build();
         let window = match window {
             Ok(window) => window,
             Err(error) => {
-                eprintln!("pin: create window failed: {error}");
+                abandon_pin(&label, error.to_string());
                 return;
             }
         };
@@ -686,15 +876,104 @@ pub fn open_pin(app: &AppHandle, path: String, x: i32, y: i32, width: u32, heigh
         if let Err(error) = window.set_always_on_top(true) {
             eprintln!("pin: always-on-top failed: {error}");
         }
-        if let Err(error) = window.show() {
-            eprintln!("pin: show window failed: {error}");
-        }
-        let _ = window.set_focus();
-        // Hide the capture layer only after the sticker window exists, so a
-        // failed build does not look like the pin button did nothing.
-        dismiss_overlay(app);
-        eprintln!("pin: window shown {label}");
-    })
+        // Composite while invisible. Showing an empty webview, or focusing it
+        // over the frozen capture, paints one blank frame.
+        cloak_pin(&window);
+    })?;
+    Ok(PinWait { rx })
+}
+
+fn abandon_pin(label: &str, error: String) {
+    if !claim_pin_reveal(label) {
+        return;
+    }
+    eprintln!("pin: create window failed: {error}");
+    signal_pin(label, Err(error));
+}
+
+fn reveal_pin(app: &AppHandle, label: &str) {
+    if pin_lock(&pin_revealed()).contains(label) {
+        return;
+    }
+    // The fallback timer can run before the window exists. Leave the claim
+    // open so the painted page can still reveal it.
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    if !claim_pin_reveal(label) {
+        return;
+    }
+    uncloak_pin(&window);
+    if let Err(error) = window.show() {
+        eprintln!("pin: show window failed: {error}");
+        signal_pin(label, Err(error.to_string()));
+        return;
+    }
+    if let Err(error) = window.set_always_on_top(true) {
+        eprintln!("pin: always-on-top failed: {error}");
+    }
+    // The sticker is on screen before the frozen capture goes away.
+    dismiss_overlay(app);
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focus();
+    signal_pin(label, Ok(()));
+    eprintln!("pin: window shown {label}");
+}
+
+#[cfg(windows)]
+fn cloak_pin(window: &WebviewWindow) {
+    use windows::Win32::Foundation::TRUE;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_TRANSITIONS_FORCEDISABLED};
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    unsafe {
+        let disable = TRUE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &disable as *const _ as *const _,
+            std::mem::size_of_val(&disable) as u32,
+        );
+        let cloak = TRUE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &cloak as *const _ as *const _,
+            std::mem::size_of_val(&cloak) as u32,
+        );
+        // Visible to the webview so it can paint, hidden from the desktop by the cloak.
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+#[cfg(not(windows))]
+fn cloak_pin(window: &WebviewWindow) {
+    let _ = window;
+}
+
+#[cfg(windows)]
+fn uncloak_pin(window: &WebviewWindow) {
+    use windows::Win32::Foundation::FALSE;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    unsafe {
+        let cloak = FALSE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &cloak as *const _ as *const _,
+            std::mem::size_of_val(&cloak) as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn uncloak_pin(window: &WebviewWindow) {
+    let _ = window;
 }
 
 const RECORDER_W: f64 = 400.0;

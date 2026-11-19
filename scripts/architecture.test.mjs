@@ -35,6 +35,14 @@ function workspaceDeps(toml) {
   return names;
 }
 
+test("the crate boundary is written down", () => {
+  const text = readFileSync("crates/ARCHITECTURE.md", "utf8");
+  assert.equal(text.includes("依赖方向"), true);
+  assert.equal(text.includes("shotlet-core"), true);
+  assert.equal(text.includes("不得依赖 core"), true);
+  assert.equal(text.includes("commands.rs"), true);
+});
+
 test("workspace crates only depend downward", () => {
   for (const [name, path] of Object.entries(manifests)) {
     const deps = workspaceDeps(readFileSync(path, "utf8")).sort();

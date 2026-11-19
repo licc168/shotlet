@@ -63,14 +63,13 @@ export function Overlay() {
     async function apply(frozen: FrozenCapture | null) {
       if (dead || !frozen) return;
       const generation = frozen.generation ?? 0;
-      if (generation === seen) return;
-      seen = generation;
+      // The cursor screen is shown first. This page also hears that event, and the
+      // other displays arrive later with the same generation. Marking it seen before
+      // this slot has pixels drops that later show, so the other screen stays blank.
+      if (generation < seen) return;
       const screen = screenOf(frozen, slot);
-      drag.current = null;
-      draftRef.current = null;
-      setDraft(null);
-      setCursor(null);
       if (!screen) {
+        if (generation === seen) return;
         ownsFollow.current = false;
         setCapture(null);
         setImage(null);
@@ -78,6 +77,12 @@ export function Overlay() {
         setArmed(false);
         return;
       }
+      if (generation === seen) return;
+      seen = generation;
+      drag.current = null;
+      draftRef.current = null;
+      setDraft(null);
+      setCursor(null);
       const cursorScreen = isCursorScreen(frozen, screen);
       ownsFollow.current = cursorScreen;
       setArmed(cursorScreen);
@@ -99,14 +104,19 @@ export function Overlay() {
       setCapture(frozen);
       setSelection(next);
     }
-    onEvent<{ armed?: boolean }>("overlay-show", (payload) => {
+    onEvent<{ armed?: boolean; slot?: number }>("overlay-show", (payload) => {
+      if (typeof payload?.slot === "number" && payload.slot !== slot) return;
       if (typeof payload?.armed === "boolean") setArmed(payload.armed);
       void currentCapture().then(apply);
     }).then((stop) => {
       if (dead) stop();
       else stops.push(stop);
     }).catch(() => undefined);
-    onEvent<boolean>("overlay-arm", (next) => {
+    onEvent<boolean | { slot?: number; armed?: boolean }>("overlay-arm", (payload) => {
+      const next = typeof payload === "boolean" ? payload : payload?.armed;
+      const eventSlot = typeof payload === "object" && payload ? payload.slot : undefined;
+      if (typeof eventSlot === "number" && eventSlot !== slot) return;
+      if (typeof next !== "boolean") return;
       setArmed(next);
       if (!next) {
         setCursor(null);
@@ -125,6 +135,18 @@ export function Overlay() {
       cancelAnimationFrame(raf.current);
       stopDragListen.current?.();
     };
+  }, []);
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key !== "Escape" || event.repeat) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) return;
+      event.preventDefault();
+      void cancelCapture();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   const picking = selection == null;
@@ -458,7 +480,6 @@ export function Overlay() {
         onWheel={(event) => {
           if (!drag.current) setHover((value) => value + (event.deltaY > 0 ? 1 : -1));
         }}
-        onKeyDown={(event) => { if (event.key === "Escape") void cancelCapture(); }}
         tabIndex={0}
       >
         {live && contains({ x: 0, y: 0, w: image.naturalWidth, h: image.naturalHeight }, live.x, live.y) && (

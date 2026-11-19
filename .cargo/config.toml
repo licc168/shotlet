@@ -1,0 +1,12 @@
+# Windows link step uses the toolchain's rust-lld, same as DBX.
+# rust-lld lives in the rustlib bin dir; cargo finds that name itself.
+#
+# jobs: this machine has 20 logical processors. Cargo's default is one rustc
+# per processor, so `tauri dev` and `tauri build` together can pin the desktop.
+# 8 is a cap, not a floor. Raise it for an unattended release build.
+
+[build]
+jobs = 8
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

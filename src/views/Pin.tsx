@@ -1,7 +1,7 @@
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { copyFile, isTauri, loadImage, pinPath } from "../api";
+import { copyFile, isTauri, loadImage, pinPath, pinReady } from "../api";
 import { useI18n } from "../i18n";
 import {
   PIN_MAX_OPACITY,
@@ -30,6 +30,7 @@ export function Pin() {
   const lastClickRef = useRef<ClickStamp | null>(null);
   const resizeRequestRef = useRef(0);
   const placedRef = useRef(false);
+  const revealedRef = useRef(false);
 
   useEffect(() => {
     const id = new URLSearchParams(location.search).get("id") ?? "";
@@ -78,6 +79,10 @@ export function Pin() {
     void fitPinWindow(scale);
   }, [scale]);
 
+  useEffect(() => {
+    if (failed) void revealPin(revealedRef);
+  }, [failed]);
+
   async function fitPinWindow(next: number) {
     const natural = naturalRef.current;
     if (!natural || !isTauri()) return;
@@ -119,7 +124,7 @@ export function Pin() {
     const image = event.currentTarget;
     if (!image.naturalWidth) return;
     naturalRef.current = { w: image.naturalWidth, h: image.naturalHeight };
-    void fitPinWindow(scale);
+    void fitPinWindow(scale).then(() => revealPin(revealedRef));
   }
 
   function onPointerDown(event: React.PointerEvent) {
@@ -172,6 +177,28 @@ export function Pin() {
       )}
     </div>
   );
+}
+
+async function revealPin(revealed: { current: boolean }) {
+  if (!isTauri() || revealed.current) return;
+  revealed.current = true;
+  // The decode callback runs before the image is on the compositor. Wait one
+  // paint, but don't wait forever if a cloaked window throttles frames.
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+    window.setTimeout(finish, 48);
+  });
+  try {
+    await pinReady();
+  } catch {
+    // The pin window may already have been closed.
+  }
 }
 
 async function closePin() {

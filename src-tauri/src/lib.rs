@@ -55,6 +55,7 @@ pub fn run() {
             commands::pin_file,
             commands::pin_png_base64,
             commands::pin_path,
+            commands::pin_ready,
             commands::read_image_bytes,
             commands::preview_rgba,
             commands::ocr_png_base64,

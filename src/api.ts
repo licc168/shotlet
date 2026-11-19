@@ -282,6 +282,12 @@ export async function pinPath(id: string): Promise<string> {
   return call<string>("pin_path", { id });
 }
 
+/** Tell the shell the sticker pixels are on the page, so it can reveal the window. */
+export async function pinReady(): Promise<void> {
+  if (!isTauri()) return;
+  await call("pin_ready");
+}
+
 export async function ocrPngBase64(data: string): Promise<string> {
   if (!isTauri()) return "Shotlet";
   return call<string>("ocr_png_base64", { data });
@@ -442,11 +448,9 @@ export async function loadFrozen(path: string, width: number, height: number): P
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { alpha: false });
   if (!ctx) return loadImage(path);
-  const pixels = new Uint8ClampedArray(raw.byteLength);
-  pixels.set(raw);
-  ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(raw), width, height), 0, 0);
   const shot = canvas as HTMLCanvasElement & ShotImage;
   shot.naturalWidth = width;
   shot.naturalHeight = height;
