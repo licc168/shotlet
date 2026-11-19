@@ -1,0 +1,61 @@
+name: version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: version-main
+  cancel-in-progress: false
+
+jobs:
+  release-new-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read version
+        id: version
+        run: |
+          version="$(node scripts/app-version.mjs)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test
+        if: steps.version.outputs.release == 'true'
+        run: npm test
+
+      - name: Tag new version
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/v${VERSION}" \
+            -f sha="${GITHUB_SHA}"
+          gh workflow run release.yml --ref "v${VERSION}"
+
+      - name: Write summary
+        run: |
+          if [ "${{ steps.version.outputs.release }}" = "true" ]; then
+            echo "v${{ steps.version.outputs.version }} 是新版本，已打标签并启动 release 打包。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "v${{ steps.version.outputs.version }} 已经发布过，这次推送不重复打包。要重打安装包，手动运行 release。" >> "$GITHUB_STEP_SUMMARY"
+          fi
