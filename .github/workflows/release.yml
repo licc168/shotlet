@@ -17,27 +17,43 @@ on:
         default: all
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          items = [
+              {"name": "macos-aarch64", "platform": "macos-latest", "args": "--target aarch64-apple-darwin", "rust_targets": "aarch64-apple-darwin"},
+              {"name": "macos-x64", "platform": "macos-latest", "args": "--target x86_64-apple-darwin", "rust_targets": "x86_64-apple-darwin"},
+              {"name": "windows-x64", "platform": "windows-latest", "args": "", "rust_targets": "x86_64-pc-windows-msvc"},
+          ]
+          target = os.environ.get("TARGET") or "all"
+          if os.environ.get("EVENT_NAME") == "workflow_dispatch" and target != "all":
+              items = [item for item in items if item["name"] == target]
+          if not items:
+              raise SystemExit(f"unknown target: {target}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write("matrix<<EOF\n")
+              handle.write(json.dumps(items))
+              handle.write("\nEOF\n")
+          PY
+
   publish:
+    needs: setup
     name: ${{ matrix.name }}
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == matrix.name }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: macos-aarch64
-            platform: macos-latest
-            args: --target aarch64-apple-darwin
-            rust-targets: aarch64-apple-darwin
-          - name: macos-x64
-            platform: macos-latest
-            args: --target x86_64-apple-darwin
-            rust-targets: x86_64-apple-darwin
-          - name: windows-x64
-            platform: windows-latest
-            args: ""
-            rust-targets: x86_64-pc-windows-msvc
+        include: ${{ fromJson(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +67,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust-targets }}
+          targets: ${{ matrix.rust_targets }}
 
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
