@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Annotator } from "../editor/Annotator";
-import { aimOverlay, cancelCapture, commitHistory, copyAnnotated, copyCaptureRegion, copyPngBase64, currentCapture, isTauri, loadFrozen, ocrPngBase64, onEvent, openRecording, overlayReady, pinAnnotated, pinCaptureRegion, pickSavePath, scrollCapture, setOverlayFollow, writePngBase64, type ShotImage } from "../api";
+import { aimOverlay, cancelCapture, commitHistory, copyAnnotated, copyCaptureRegion, copyPngBase64, currentCapture, isTauri, loadFrozen, ocrPngBase64, onEvent, openRecording, overlayReady, pinAnnotated, pinAnnotatedRgba, pinCaptureRegion, pinHistory, pickSavePath, scrollCapture, setOverlayFollow, writePngBase64, type ShotImage } from "../api";
 import { screenCssSize } from "../editor/draw";
 import { useI18n } from "../i18n";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
@@ -439,6 +439,33 @@ export function Overlay() {
           }}
           onPlainCopy={(region) => finishCopy(region)}
           onPlainPin={(region) => finishPin(region)}
+          onAnnotatedPin={async (pixels, width, height, region, layers) => {
+            const x = Math.max(0, Math.round(region.x));
+            const y = Math.max(0, Math.round(region.y));
+            const w = Math.max(1, Math.round(region.w));
+            const h = Math.max(1, Math.round(region.h));
+            try {
+              const id = await pinAnnotatedRgba(pixels, width, height, {
+                x: screen.x + x,
+                y: screen.y + y,
+                width: w,
+                height: h,
+                screenX: screen.screenX,
+                screenY: screen.screenY,
+                localX: x,
+                localY: y,
+                bitmapW: image.naturalWidth,
+                bitmapH: image.naturalHeight,
+                pointW: screen.pointWidth || image.naturalWidth,
+                pointH: screen.pointHeight || image.naturalHeight,
+              });
+              if (id) void pinHistory(id, JSON.stringify(layers));
+              await cancelCapture();
+              return true;
+            } catch {
+              return false;
+            }
+          }}
           onRecord={() => {
             void openRecording(
               screen.screenX,

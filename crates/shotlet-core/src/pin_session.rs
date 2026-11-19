@@ -40,6 +40,8 @@ pub struct PinSlot {
     pub phase: PinPhase,
     pub group: u8,
     pub image: Option<Arc<RgbaImage>>,
+    /// Unmarked crop kept until `pin_history` records it. Not the picture on screen.
+    pub base: Option<Arc<RgbaImage>>,
     pub file: Option<PathBuf>,
     pub cut: Option<PinCut>,
     pub frame: Option<PinFrame>,
@@ -71,6 +73,7 @@ fn blank() -> PinSlot {
         phase: PinPhase::Warming,
         group: 0,
         image: None,
+        base: None,
         file: None,
         cut: None,
         frame: None,
@@ -135,8 +138,19 @@ pub fn assign(state: &AppState, label: &str, group: u8, image: Option<Arc<RgbaIm
     slot.phase = PinPhase::Assigned;
     slot.group = group;
     slot.image = image;
+    slot.base = None;
     slot.file = file;
     slot.cut = Some(cut);
+}
+
+pub fn note_base(state: &AppState, label: &str, base: PinImage) {
+    if let Some(slot) = book(state).slots.get_mut(label) {
+        slot.base = Some(base);
+    }
+}
+
+pub fn take_base(state: &AppState, id: &str) -> Option<PinImage> {
+    book(state).slots.get_mut(&label_of(id)).and_then(|slot| slot.base.take())
 }
 
 pub fn note_frame(state: &AppState, label: &str, frame: PinFrame) {

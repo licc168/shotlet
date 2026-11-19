@@ -292,6 +292,53 @@ export async function pinCaptureRegion(
   await call("pin_capture_region", { x, y, width, height, screenX, screenY, localX, localY, bitmapW, bitmapH, pointW, pointH });
 }
 
+export type PinPlace = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  screenX: number;
+  screenY: number;
+  localX: number;
+  localY: number;
+  bitmapW: number;
+  bitmapH: number;
+  pointW: number;
+  pointH: number;
+};
+
+/** Send painted RGBA. Returns the pin id. An empty id means the base64 path already saved history. */
+export async function pinAnnotatedRgba(pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, place: PinPlace): Promise<string> {
+  tracePage("pin: annotated rgba");
+  if (!isTauri()) return "";
+  const { invoke } = await import("@tauri-apps/api/core");
+  const body = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+  return invoke<string>("pin_annotated", body, {
+    headers: {
+      "x-pin-x": String(place.x),
+      "x-pin-y": String(place.y),
+      "x-pin-w": String(place.width),
+      "x-pin-h": String(place.height),
+      "x-pin-screen-x": String(place.screenX),
+      "x-pin-screen-y": String(place.screenY),
+      "x-pin-local-x": String(place.localX),
+      "x-pin-local-y": String(place.localY),
+      "x-pin-bitmap-w": String(place.bitmapW),
+      "x-pin-bitmap-h": String(place.bitmapH),
+      "x-pin-point-w": String(place.pointW),
+      "x-pin-point-h": String(place.pointH),
+      "x-pin-pixel-w": String(width),
+      "x-pin-pixel-h": String(height),
+    },
+  });
+}
+
+/** Record the annotation after the sticker is already on screen. */
+export async function pinHistory(id: string, document: string): Promise<void> {
+  if (!isTauri() || !id) return;
+  await call("pin_history", { id, document });
+}
+
 export async function pinAnnotated(
   png: string,
   base: string,

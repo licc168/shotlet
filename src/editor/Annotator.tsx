@@ -3,7 +3,7 @@ import { isDoubleClick } from "../lib/pin";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
 import { useI18n } from "../i18n";
 import { tracePage, type ShotImage } from "../api";
-import { previewScale, renderPng, renderScene } from "./draw";
+import { previewScale, renderPng, renderRgba, renderScene } from "./draw";
 import { appendStrokePoint, COLORS, hitTest, layerBounds, MAX_FONT, MIN_FONT, moveLayer, parseLayers, resizeBox, resizeTextLayer, uid, type Layer } from "./model";
 
 type Tool = "select" | "rect" | "ellipse" | "arrow" | "brush" | "mosaic" | "highlight" | "text" | "number" | "watermark";
@@ -22,6 +22,7 @@ type Props = {
   onAction: (action: Action, png: string, base: string, layers: Layer[]) => Promise<string | void>;
   onPlainCopy?: (selection: Rect) => Promise<boolean>;
   onPlainPin?: (selection: Rect) => Promise<boolean>;
+  onAnnotatedPin?: (pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, selection: Rect, layers: Layer[]) => Promise<boolean>;
   onScroll?: () => void;
   onRecord?: () => void;
   onRotate?: (layers: Layer[]) => void;
@@ -612,6 +613,17 @@ export function Annotator(props: Props) {
       if (action === "pin" && marks.length === 0 && props.onPlainPin) {
         const handled = await props.onPlainPin(selection);
         if (handled) return;
+      }
+      if (action === "pin" && marks.length > 0 && props.onAnnotatedPin) {
+        try {
+          tracePage("pin: render begin");
+          const frame = renderRgba(props.image, selection, marks);
+          tracePage("pin: render done");
+          const handled = await props.onAnnotatedPin(frame.pixels, frame.width, frame.height, selection, marks);
+          if (handled) return;
+        } catch {
+          // Binary bodies are not available everywhere. The base64 path below still pins.
+        }
       }
       const baseTask = action === "pin" ? Promise.resolve("") : renderPng(props.image, selection, [], false);
       if (action === "pin") tracePage("pin: render begin");

@@ -57,6 +57,7 @@ pub fn run() {
             commands::pin_png_base64,
             commands::pin_capture_region,
             commands::pin_annotated,
+            commands::pin_history,
             commands::pin_path,
             commands::pin_pixels,
             commands::copy_pin,

@@ -472,9 +472,9 @@ pub async fn pin_capture_region(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn pin_annotated(
-    app: AppHandle,
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotatedJson {
     png: String,
     base: String,
     document: String,
@@ -488,9 +488,19 @@ pub async fn pin_annotated(
     bitmap_h: f64,
     point_w: f64,
     point_h: f64,
-) -> Result<(), String> {
-    library::trace("pin: annotated command");
-    let (place_x, place_y, place_w, place_h) = capture_session::desktop_rect(
+}
+
+fn header_f64(headers: &tauri::http::HeaderMap, name: &str) -> f64 {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &f64| value.is_finite())
+        .unwrap_or(0.0)
+}
+
+fn place_from_parts(screen_x: f64, screen_y: f64, local_x: f64, local_y: f64, width: f64, height: f64, bitmap_w: f64, bitmap_h: f64, point_w: f64, point_h: f64) -> (i32, i32, u32, u32) {
+    capture_session::desktop_rect(
         round_i32(screen_x),
         round_i32(screen_y),
         round_i32(local_x),
@@ -501,26 +511,86 @@ pub async fn pin_annotated(
         bitmap_h.round().max(1.0) as u32,
         point_w.round().max(0.0) as u32,
         point_h.round().max(0.0) as u32,
+    )
+}
+
+#[tauri::command(async)]
+pub fn pin_annotated(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    library::trace("pin: annotated command");
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => pin_annotated_raw(&app, bytes, request.headers()),
+        tauri::ipc::InvokeBody::Json(value) => {
+            pin_annotated_json(&app, value)?;
+            Ok(String::new())
+        }
+    }
+}
+
+fn pin_annotated_raw(app: &AppHandle, bytes: &[u8], headers: &tauri::http::HeaderMap) -> Result<String, String> {
+    let pixel_w = header_f64(headers, "x-pin-pixel-w").round().max(1.0) as u32;
+    let pixel_h = header_f64(headers, "x-pin-pixel-h").round().max(1.0) as u32;
+    let image = library::rgba_pin(bytes.to_vec(), pixel_w, pixel_h)?;
+    let (place_x, place_y, place_w, place_h) = place_from_parts(
+        header_f64(headers, "x-pin-screen-x"),
+        header_f64(headers, "x-pin-screen-y"),
+        header_f64(headers, "x-pin-local-x"),
+        header_f64(headers, "x-pin-local-y"),
+        header_f64(headers, "x-pin-w"),
+        header_f64(headers, "x-pin-h"),
+        header_f64(headers, "x-pin-bitmap-w"),
+        header_f64(headers, "x-pin-bitmap-h"),
+        header_f64(headers, "x-pin-point-w"),
+        header_f64(headers, "x-pin-point-h"),
     );
-    let root = storage(&app)?;
-    let (path, pixels_w, pixels_h) = tauri::async_runtime::spawn_blocking(move || {
-        library::pin_annotated(&root, &png, &base, &document)
-    })
-    .await
-    .map_err(err)??;
+    let crop_x = header_f64(headers, "x-pin-x").round() as i32;
+    let crop_y = header_f64(headers, "x-pin-y").round() as i32;
+    let crop_w = header_f64(headers, "x-pin-w").round().max(1.0) as u32;
+    let crop_h = header_f64(headers, "x-pin-h").round().max(1.0) as u32;
+    let base = match library::taken_capture(app.state::<AppState>().inner()) {
+        Ok(taken) => library::crop_pin_image(taken, crop_x, crop_y, crop_w, crop_h).unwrap_or_else(|error| {
+            eprintln!("pin: base crop failed: {error}");
+            image.clone()
+        }),
+        Err(error) => {
+            eprintln!("pin: base crop failed: {error}");
+            image.clone()
+        }
+    };
+    library::trace("pin: annotated cropped");
+    let wait = ui::open_annotated(app, image, base, place_x, place_y, place_w, place_h)?;
+    let id = wait.id().to_string();
+    wait.wait()?;
+    Ok(id)
+}
+
+fn pin_annotated_json(app: &AppHandle, value: &serde_json::Value) -> Result<(), String> {
+    let body: AnnotatedJson = serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    let (place_x, place_y, place_w, place_h) = place_from_parts(
+        body.screen_x,
+        body.screen_y,
+        body.local_x,
+        body.local_y,
+        body.width,
+        body.height,
+        body.bitmap_w,
+        body.bitmap_h,
+        body.point_w,
+        body.point_h,
+    );
+    let root = storage(app)?;
+    let (path, pixels_w, pixels_h) = library::pin_annotated(&root, &body.png, &body.base, &body.document)?;
     library::trace("pin: annotated file written");
-    ui::open_file(
-        &app,
-        path.to_string_lossy().to_string(),
-        place_x,
-        place_y,
-        place_w,
-        place_h,
-        pixels_w,
-        pixels_h,
-    )?
-    .ready()
-    .await?;
+    ui::open_file(app, path.to_string_lossy().to_string(), place_x, place_y, place_w, place_h, pixels_w, pixels_h)?.wait()?;
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn pin_history(app: AppHandle, id: String, document: String) -> Result<(), String> {
+    let root = storage(&app)?;
+    let state = app.state::<AppState>();
+    let annotated = library::pin_image_or_file(&state, &id)?;
+    let base = pin_session::take_base(state.inner(), &id).unwrap_or_else(|| annotated.clone());
+    library::queue_pin_history(&root, &annotated, &base, &document);
     Ok(())
 }
 

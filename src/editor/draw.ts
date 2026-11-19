@@ -286,6 +286,16 @@ function distanceToSegment(x: number, y: number, start: Point, end: Point): numb
   return px * px + py * py;
 }
 
+/** Painted selection as RGBA. Scale 1 matches one captured pixel. */
+export function renderRgba(image: CanvasImageSource, selection: Rect, layers: Layer[]): { pixels: Uint8ClampedArray<ArrayBuffer>; width: number; height: number } {
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("canvas");
+  renderScene(ctx, image, selection, layers, 1);
+  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  return { pixels: frame.data, width: canvas.width, height: canvas.height };
+}
+
 export async function renderPng(image: CanvasImageSource, selection: Rect, layers: Layer[], annotate: boolean): Promise<string> {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");

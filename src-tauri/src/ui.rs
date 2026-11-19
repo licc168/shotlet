@@ -774,6 +774,13 @@ pub struct PinWait {
     rx: std::sync::mpsc::Receiver<Result<(), String>>,
     app: AppHandle,
     label: String,
+    id: String,
+}
+
+impl PinWait {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 impl PinWait {
@@ -915,7 +922,7 @@ fn publish_pin(app: &AppHandle, label: &str, root: PathBuf, image: pin_session::
     });
 }
 
-fn arm_pin_wait(app: &AppHandle, label: &str) -> PinWait {
+fn arm_pin_wait(app: &AppHandle, label: &str, id: &str) -> PinWait {
     let (tx, rx) = std::sync::mpsc::channel();
     pin_lock(&pin_signals()).insert(label.to_string(), tx);
     let timeout_app = app.clone();
@@ -924,7 +931,27 @@ fn arm_pin_wait(app: &AppHandle, label: &str) -> PinWait {
         std::thread::sleep(PIN_REVEAL_FALLBACK);
         let _ = on_main(&timeout_app, move |app| reveal_pin(app, &timeout_label));
     });
-    PinWait { rx, app: app.clone(), label: label.to_string() }
+    PinWait { rx, app: app.clone(), label: label.to_string(), id: id.to_string() }
+}
+
+fn publish_file(app: &AppHandle, label: &str, image: pin_session::PinImage) {
+    let app = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        let path = match shotlet_core::library::write_pin_file(&image) {
+            Ok((path, _png)) => path,
+            Err(error) => {
+                eprintln!("pin: store failed: {error}");
+                return;
+            }
+        };
+        let app = app.clone();
+        let _ = app.clone().run_on_main_thread(move || {
+            let state = app.state::<AppState>();
+            pin_session::set_file(state.inner(), &label, path);
+            pin_session::release_image(state.inner(), &label);
+        });
+    });
 }
 
 fn take_spare(app: &AppHandle) -> Option<String> {
@@ -954,7 +981,7 @@ pub fn open_file(
     pixels_w: u32,
     pixels_h: u32,
 ) -> Result<PinWait, String> {
-    open_picture(app, None, Some(PathBuf::from(path)), None, x, y, window_w, window_h, pixels_w, pixels_h)
+    open_picture(app, None, Some(PathBuf::from(path)), None, None, false, x, y, window_w, window_h, pixels_w, pixels_h)
 }
 
 pub fn open_memory(
@@ -968,7 +995,22 @@ pub fn open_memory(
 ) -> Result<PinWait, String> {
     let pixels_w = image.width();
     let pixels_h = image.height();
-    open_picture(app, Some(image), None, Some(root), x, y, window_w, window_h, pixels_w, pixels_h)
+    open_picture(app, Some(image), None, Some(root), None, true, x, y, window_w, window_h, pixels_w, pixels_h)
+}
+
+/// Annotated pixels stay in memory. The unmarked crop is kept for `pin_history`.
+pub fn open_annotated(
+    app: &AppHandle,
+    image: pin_session::PinImage,
+    base: pin_session::PinImage,
+    x: i32,
+    y: i32,
+    window_w: u32,
+    window_h: u32,
+) -> Result<PinWait, String> {
+    let pixels_w = image.width();
+    let pixels_h = image.height();
+    open_picture(app, Some(image), None, None, Some(base), false, x, y, window_w, window_h, pixels_w, pixels_h)
 }
 
 fn open_picture(
@@ -976,6 +1018,8 @@ fn open_picture(
     image: Option<pin_session::PinImage>,
     path: Option<PathBuf>,
     root: Option<PathBuf>,
+    base: Option<pin_session::PinImage>,
+    record_history: bool,
     x: i32,
     y: i32,
     window_w: u32,
@@ -996,10 +1040,19 @@ fn open_picture(
     };
     let label = reused.clone().unwrap_or_else(|| format!("pin-{id}"));
     remember_pin(app, &label, image.clone(), path, x, y, window_w, window_h)?;
-    if let (Some(image), Some(root)) = (image, root) {
-        publish_pin(app, &label, root, image);
+    if let Some(base) = base {
+        pin_session::note_base(app.state::<AppState>().inner(), &label, base);
     }
-    let wait = arm_pin_wait(app, &label);
+    if let Some(image) = image {
+        if record_history {
+            if let Some(root) = root {
+                publish_pin(app, &label, root, image);
+            }
+        } else {
+            publish_file(app, &label, image);
+        }
+    }
+    let wait = arm_pin_wait(app, &label, &id);
     if reused.is_some() {
         hand_pin(app, label, id, x, y, window_w, window_h, pixels_w, pixels_h)?;
     } else {

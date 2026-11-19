@@ -248,11 +248,17 @@ pub fn crop_pin_image(taken: (Vec<capture::ScreenImage>, String), x: i32, y: i32
     Ok(std::sync::Arc::new(cropped))
 }
 
-/// Encode once. The same bytes go to the pin file and to history.
-pub fn store_pin(root: &Path, image: &image::RgbaImage) -> Result<PathBuf, String> {
+/// Encode once and write the sticker file. History is a separate step.
+pub fn write_pin_file(image: &image::RgbaImage) -> Result<(PathBuf, Vec<u8>), String> {
     let png = util::encode_png_fast(image)?;
     let path = capture::capture_dir().join(format!("pin-{}.png", util::new_id()));
     util::write_bytes(&path, &png)?;
+    Ok((path, png))
+}
+
+/// Encode once. The same bytes go to the pin file and to history.
+pub fn store_pin(root: &Path, image: &image::RgbaImage) -> Result<PathBuf, String> {
+    let (path, png) = write_pin_file(image)?;
     let root = root.to_path_buf();
     let width = image.width();
     let height = image.height();
@@ -262,6 +268,52 @@ pub fn store_pin(root: &Path, image: &image::RgbaImage) -> Result<PathBuf, Strin
         }
     });
     Ok(path)
+}
+
+pub fn rgba_pin(bytes: Vec<u8>, width: u32, height: u32) -> Result<crate::pin_session::PinImage, String> {
+    if width == 0 || height == 0 || bytes.len() != width as usize * height as usize * 4 {
+        return Err("标注像素尺寸不对".into());
+    }
+    let image = image::RgbaImage::from_raw(width, height, bytes).ok_or_else(|| "标注像素尺寸不对".to_string())?;
+    Ok(std::sync::Arc::new(image))
+}
+
+pub fn pin_image_or_file(state: &AppState, id: &str) -> Result<crate::pin_session::PinImage, String> {
+    if let Some(image) = crate::pin_session::image_of(state, id) {
+        return Ok(image);
+    }
+    let path = crate::pin_session::file_path(state, id)?;
+    let image = util::read_png_file(Path::new(&path))?;
+    Ok(std::sync::Arc::new(image))
+}
+
+/// History for an annotated pin. The window is already up; this does not block it.
+pub fn queue_pin_history(root: &Path, annotated: &crate::pin_session::PinImage, base: &crate::pin_session::PinImage, document: &str) {
+    let root = root.to_path_buf();
+    let annotated = annotated.clone();
+    let base = base.clone();
+    let document = document.to_string();
+    let width = annotated.width();
+    let height = annotated.height();
+    std::thread::spawn(move || {
+        let png = match util::encode_png_fast(&annotated) {
+            Ok(png) => png,
+            Err(error) => {
+                eprintln!("history: {error}");
+                return;
+            }
+        };
+        let base_png = match util::encode_png_fast(&base) {
+            Ok(png) => png,
+            Err(error) => {
+                eprintln!("history: {error}");
+                return;
+            }
+        };
+        if let Err(error) = history::commit_bytes(&root, &png, &base_png, &document, width, height, "", "") {
+            eprintln!("history: {error}");
+        }
+    });
 }
 
 pub fn pin_rgba(state: &AppState, id: &str) -> Result<Vec<u8>, String> {
