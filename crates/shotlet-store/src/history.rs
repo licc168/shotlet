@@ -1,17 +1,44 @@
+use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 
 pub use shotlet_types::{CommitRequest, HistoryItem, Record};
 use shotlet_platform::{decode_png, err, load_rgba, new_id};
 
-fn index_gate() -> &'static Mutex<()> {
-    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(()))
+fn index_cache() -> &'static RwLock<HashMap<PathBuf, Vec<Record>>> {
+    static CACHE: OnceLock<RwLock<HashMap<PathBuf, Vec<Record>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn with_index<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let _guard = index_gate().lock().map_err(|error| error.to_string())?;
-    body()
+fn with_read<T>(root: &Path, body: impl FnOnce(&[Record]) -> Result<T, String>) -> Result<T, String> {
+    {
+        let guard = index_cache().read().map_err(|error| error.to_string())?;
+        if let Some(records) = guard.get(root) {
+            return body(records);
+        }
+    }
+    let mut guard = index_cache().write().map_err(|error| error.to_string())?;
+    if let Some(records) = guard.get(root) {
+        return body(records);
+    }
+    let records = read_index(root)?;
+    let result = body(&records)?;
+    guard.insert(root.to_path_buf(), records);
+    Ok(result)
+}
+
+fn with_write<T>(root: &Path, body: impl FnOnce(&mut Vec<Record>) -> Result<T, String>) -> Result<T, String> {
+    let mut guard = index_cache().write().map_err(|error| error.to_string())?;
+    let mut records = if let Some(records) = guard.get(root) {
+        records.clone()
+    } else {
+        read_index(root)?
+    };
+    let result = body(&mut records)?;
+    store_all(root, &records)?;
+    guard.insert(root.to_path_buf(), records);
+    Ok(result)
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -19,6 +46,24 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(err)?;
     }
     std::fs::write(path, bytes).map_err(err)
+}
+
+/// Identical png and base share one inode. A failed link falls back to a second write.
+fn write_linked(png_path: &Path, base_path: &Path, png: &[u8], base: &[u8]) -> Result<(), String> {
+    write_bytes(png_path, png)?;
+    if png != base {
+        return write_bytes(base_path, base);
+    }
+    if base_path == png_path {
+        return Ok(());
+    }
+    if base_path.exists() {
+        let _ = std::fs::remove_file(base_path);
+    }
+    match std::fs::hard_link(png_path, base_path) {
+        Ok(()) => Ok(()),
+        Err(_) => write_bytes(base_path, base),
+    }
 }
 
 fn png_payload(data: &str) -> Result<Vec<u8>, String> {
@@ -33,11 +78,21 @@ fn index_path(root: &Path) -> PathBuf {
     root.join("index.json")
 }
 
-fn load_all(root: &Path) -> Vec<Record> {
-    let Ok(text) = std::fs::read_to_string(index_path(root)) else {
-        return Vec::new();
+fn read_index(root: &Path) -> Result<Vec<Record>, String> {
+    let path = index_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(err(error)),
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    match serde_json::from_str(&text) {
+        Ok(records) => Ok(records),
+        Err(error) => {
+            let backup = path.with_file_name("index.json.broken");
+            let _ = std::fs::copy(&path, &backup);
+            Err(format!("历史索引已损坏，原文件还在，已备份为 index.json.broken：{error}"))
+        }
+    }
 }
 
 fn store_all(root: &Path, records: &[Record]) -> Result<(), String> {
@@ -49,13 +104,16 @@ fn store_all(root: &Path, records: &[Record]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(err)
 }
 
-pub fn list(root: &Path, query: &str, filter: &str) -> Vec<HistoryItem> {
+pub fn list(root: &Path, query: &str, filter: &str) -> Result<Vec<HistoryItem>, String> {
     let needle = query.trim().to_lowercase();
-    load_all(root)
-        .into_iter()
-        .filter(|record| record_matches(record, &needle, filter))
-        .map(to_item)
-        .collect()
+    with_read(root, |records| {
+        Ok(records
+            .iter()
+            .filter(|record| record_matches(record, &needle, filter))
+            .cloned()
+            .map(to_item)
+            .collect())
+    })
 }
 
 pub fn record_matches(record: &Record, needle: &str, filter: &str) -> bool {
@@ -113,15 +171,14 @@ pub fn commit_bytes(
     name: &str,
     ocr_text: &str,
 ) -> Result<HistoryItem, String> {
-    with_index(|| {
+    with_write(root, |records| {
         let id = new_id();
         let images = root.join("images");
         let docs = root.join("docs");
         let file = images.join(format!("{id}.png"));
         let base_file = images.join(format!("{id}.base.png"));
         let doc_file = docs.join(format!("{id}.json"));
-        write_bytes(&file, png)?;
-        write_bytes(&base_file, base)?;
+        write_linked(&file, &base_file, png, base)?;
         write_bytes(&doc_file, document.as_bytes())?;
         let label = if name.trim().is_empty() { format!("截图 {id}") } else { name.to_string() };
         let record = Record {
@@ -138,9 +195,7 @@ pub fn commit_bytes(
             document: doc_file.to_string_lossy().to_string(),
             deleted_at: None,
         };
-        let mut records = load_all(root);
         records.insert(0, record.clone());
-        store_all(root, &records)?;
         Ok(to_item(record))
     })
 }
@@ -148,16 +203,14 @@ pub fn commit_bytes(
 pub fn update_document(root: &Path, id: &str, request: CommitRequest) -> Result<HistoryItem, String> {
     let png = png_payload(&request.png_base64)?;
     let base = png_payload(&request.base_png_base64)?;
-    with_index(|| update_locked(root, id, &request, &png, &base))
+    with_write(root, |records| update_locked(records, id, &request, &png, &base))
 }
 
-fn update_locked(root: &Path, id: &str, request: &CommitRequest, png: &[u8], base: &[u8]) -> Result<HistoryItem, String> {
-    let mut records = load_all(root);
+fn update_locked(records: &mut Vec<Record>, id: &str, request: &CommitRequest, png: &[u8], base: &[u8]) -> Result<HistoryItem, String> {
     let Some(record) = records.iter_mut().find(|record| record.id == id) else {
         return Err("找不到这条历史记录".into());
     };
-    write_bytes(Path::new(&record.file), png)?;
-    write_bytes(Path::new(&record.base_file), base)?;
+    write_linked(Path::new(&record.file), Path::new(&record.base_file), png, base)?;
     write_bytes(Path::new(&record.document), request.document.as_bytes())?;
     record.width = request.width;
     record.height = request.height;
@@ -165,45 +218,39 @@ fn update_locked(root: &Path, id: &str, request: &CommitRequest, png: &[u8], bas
     if !request.name.trim().is_empty() {
         record.name = request.name.clone();
     }
-    let item = to_item(record.clone());
-    store_all(root, &records)?;
-    Ok(item)
+    Ok(to_item(record.clone()))
 }
 
 pub fn editor_source(root: &Path, id: &str) -> Result<(String, u32, u32, String), String> {
-    let records = load_all(root);
-    let Some(record) = records.into_iter().find(|record| record.id == id) else {
-        return Err("找不到这条历史记录".into());
-    };
+    let record = with_read(root, |records| {
+        records
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
+            .ok_or_else(|| "找不到这条历史记录".to_string())
+    })?;
     let document = std::fs::read_to_string(&record.document).unwrap_or_else(|_| "[]".into());
     Ok((record.base_file, record.width, record.height, document))
 }
 
-pub fn latest_file(root: &Path) -> Option<String> {
-    load_all(root)
-        .into_iter()
-        .find(|record| record.deleted_at.is_none())
-        .map(|record| record.file)
+pub fn latest_file(root: &Path) -> Result<Option<String>, String> {
+    with_read(root, |records| {
+        Ok(records.iter().find(|record| record.deleted_at.is_none()).map(|record| record.file.clone()))
+    })
 }
 
 fn mutate<F>(root: &Path, ids: &[String], change: F) -> Result<(), String>
 where
     F: Fn(&mut Record),
 {
-    with_index(|| mutate_locked(root, ids, change))
-}
-
-fn mutate_locked<F>(root: &Path, ids: &[String], change: F) -> Result<(), String>
-where
-    F: Fn(&mut Record),
-{
-    let mut records = load_all(root);
-    for record in &mut records {
-        if ids.iter().any(|id| id == &record.id) {
-            change(record);
+    with_write(root, |records| {
+        for record in records.iter_mut() {
+            if ids.iter().any(|id| id == &record.id) {
+                change(record);
+            }
         }
-    }
-    store_all(root, &records)
+        Ok(())
+    })
 }
 
 pub fn set_favorite(root: &Path, id: &str, favorite: bool) -> Result<(), String> {
@@ -228,23 +275,21 @@ pub fn restore(root: &Path, ids: &[String]) -> Result<(), String> {
 }
 
 pub fn purge(root: &Path) -> Result<(), String> {
-    with_index(|| purge_locked(root))
-}
-
-fn purge_locked(root: &Path) -> Result<(), String> {
-    let records = load_all(root);
-    let (gone, kept): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| record.deleted_at.is_some());
-    for record in gone {
-        let _ = std::fs::remove_file(&record.file);
-        let _ = std::fs::remove_file(&record.base_file);
-        let _ = std::fs::remove_file(&record.document);
-    }
-    store_all(root, &kept)
+    with_write(root, |records| {
+        let (gone, kept): (Vec<_>, Vec<_>) = records.iter().cloned().partition(|record| record.deleted_at.is_some());
+        for record in gone {
+            let _ = std::fs::remove_file(&record.file);
+            let _ = std::fs::remove_file(&record.base_file);
+            let _ = std::fs::remove_file(&record.document);
+        }
+        *records = kept;
+        Ok(())
+    })
 }
 
 pub fn export(root: &Path, ids: &[String], dest: &Path) -> Result<u32, String> {
     std::fs::create_dir_all(dest).map_err(err)?;
-    let records = load_all(root);
+    let records = with_read(root, |records| Ok(records.to_vec()))?;
     let mut count = 0u32;
     for record in records {
         if !ids.iter().any(|id| id == &record.id) {
@@ -271,9 +316,31 @@ fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn search_matches_ocr_name_and_tags() {
-        let record = Record {
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "shotlet-history-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            if let Ok(mut cache) = index_cache().write() {
+                cache.remove(&self.0);
+            }
+        }
+    }
+
+    fn sample() -> Record {
+        Record {
             id: "1".into(),
             created_at: 1,
             name: "发票".into(),
@@ -286,7 +353,12 @@ mod tests {
             base_file: String::new(),
             document: String::new(),
             deleted_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn search_matches_ocr_name_and_tags() {
+        let record = sample();
         assert!(record_matches(&record, "128", "all"));
         assert!(record_matches(&record, "报销", "favorite"));
         assert!(!record_matches(&record, "128", "deleted"));
@@ -294,5 +366,37 @@ mod tests {
         deleted.deleted_at = Some(2);
         assert!(record_matches(&deleted, "", "deleted"));
         assert!(!record_matches(&deleted, "", "all"));
+    }
+
+    #[test]
+    fn missing_index_stays_empty() {
+        let root = TempRoot::new("missing");
+        let items = list(&root.0, "", "all").unwrap();
+        assert!(items.is_empty());
+        assert!(!root.0.join("index.json").exists());
+    }
+
+    #[test]
+    fn corrupt_index_is_kept() {
+        let root = TempRoot::new("corrupt");
+        let path = root.0.join("index.json");
+        std::fs::write(&path, "{").unwrap();
+        let error = rename(&root.0, "1", "新名字".into()).unwrap_err();
+        assert!(error.contains("损坏"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{");
+        assert_eq!(std::fs::read_to_string(root.0.join("index.json.broken")).unwrap(), "{");
+        assert!(list(&root.0, "", "all").is_err());
+    }
+
+    #[test]
+    fn readable_index_is_listed_from_memory() {
+        let root = TempRoot::new("readable");
+        let text = serde_json::to_string(&vec![sample()]).unwrap();
+        std::fs::write(root.0.join("index.json"), &text).unwrap();
+        let items = list(&root.0, "发票", "all").unwrap();
+        assert_eq!(items.len(), 1);
+        std::fs::write(root.0.join("index.json"), "[]").unwrap();
+        let cached = list(&root.0, "", "all").unwrap();
+        assert_eq!(cached.len(), 1, "a later disk change must not bypass the locked cache");
     }
 }

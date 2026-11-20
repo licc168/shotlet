@@ -44,10 +44,21 @@ impl AudioCapture {
         self.stop.store(true, Ordering::Relaxed);
         let thread = self.thread.take().ok_or("音频线程已经结束")?;
         thread.join().map_err(|_| "音频线程异常退出".to_string())??;
-        if !self.wav.exists() {
+        // Drop 实现后不能把字段 move 出去；取出路径后 Drop 只负责收尾已结束的线程。
+        let wav = std::mem::take(&mut self.wav);
+        if !wav.exists() {
             return Err("没有采到声音".into());
         }
-        Ok(self.wav)
+        Ok(wav)
+    }
+}
+
+impl Drop for AudioCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

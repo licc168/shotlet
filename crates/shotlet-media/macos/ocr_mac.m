@@ -30,36 +30,79 @@ static void shotlet_set_error(char **error_out, NSString *message) {
     *error_out = shotlet_dup_utf8(message.length > 0 ? message : @"文字识别失败");
 }
 
+static NSString *shotlet_text_of(VNRecognizedTextObservation *observation) {
+    VNRecognizedText *candidate = [[observation topCandidates:1] firstObject];
+    NSString *text = [candidate.string stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return text == nil ? @"" : text;
+}
+
+static NSComparisonResult shotlet_compare_top_then_x(VNRecognizedTextObservation *left, VNRecognizedTextObservation *right) {
+    CGFloat left_top = CGRectGetMaxY(left.boundingBox);
+    CGFloat right_top = CGRectGetMaxY(right.boundingBox);
+    if (left_top > right_top) {
+        return NSOrderedAscending;
+    }
+    if (left_top < right_top) {
+        return NSOrderedDescending;
+    }
+    CGFloat left_x = CGRectGetMinX(left.boundingBox);
+    CGFloat right_x = CGRectGetMinX(right.boundingBox);
+    if (left_x < right_x) {
+        return NSOrderedAscending;
+    }
+    if (left_x > right_x) {
+        return NSOrderedDescending;
+    }
+    return NSOrderedSame;
+}
+
+static NSComparisonResult shotlet_compare_x(VNRecognizedTextObservation *left, VNRecognizedTextObservation *right) {
+    CGFloat left_x = CGRectGetMinX(left.boundingBox);
+    CGFloat right_x = CGRectGetMinX(right.boundingBox);
+    if (left_x < right_x) {
+        return NSOrderedAscending;
+    }
+    if (left_x > right_x) {
+        return NSOrderedDescending;
+    }
+    return NSOrderedSame;
+}
+
+static NSString *shotlet_join_line(NSArray<VNRecognizedTextObservation *> *line) {
+    NSArray<VNRecognizedTextObservation *> *ordered =
+        [line sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *left,
+                                                              VNRecognizedTextObservation *right) {
+          return shotlet_compare_x(left, right);
+        }];
+    NSMutableArray<NSString *> *words = [NSMutableArray array];
+    for (VNRecognizedTextObservation *observation in ordered) {
+        NSString *text = shotlet_text_of(observation);
+        if (text.length == 0) {
+            continue;
+        }
+        [words addObject:text];
+    }
+    return [words componentsJoinedByString:@" "];
+}
+
 static NSString *shotlet_join_observations(NSArray<VNRecognizedTextObservation *> *observations) {
     if (observations.count == 0) {
         return @"";
     }
+    // Exact top, then x. A "same line" tolerance is not transitive, so it cannot live in the comparator.
     NSArray<VNRecognizedTextObservation *> *sorted =
         [observations sortedArrayUsingComparator:^NSComparisonResult(VNRecognizedTextObservation *left,
                                                                       VNRecognizedTextObservation *right) {
-          CGRect left_box = left.boundingBox;
-          CGRect right_box = right.boundingBox;
-          CGFloat left_top = CGRectGetMaxY(left_box);
-          CGFloat right_top = CGRectGetMaxY(right_box);
-          CGFloat tolerance = MAX(left_box.size.height, right_box.size.height) * 0.5;
-          if (fabs(left_top - right_top) > tolerance) {
-              return left_top > right_top ? NSOrderedAscending : NSOrderedDescending;
-          }
-          if (fabs(left_box.origin.x - right_box.origin.x) > 0.002) {
-              return left_box.origin.x < right_box.origin.x ? NSOrderedAscending : NSOrderedDescending;
-          }
-          return NSOrderedSame;
+          return shotlet_compare_top_then_x(left, right);
         }];
 
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
-    NSMutableArray<NSString *> *current = [NSMutableArray array];
+    NSMutableArray<VNRecognizedTextObservation *> *current = [NSMutableArray array];
     CGFloat line_top = 0;
     CGFloat line_height = 0;
     BOOL has_line = NO;
     for (VNRecognizedTextObservation *observation in sorted) {
-        VNRecognizedText *candidate = [[observation topCandidates:1] firstObject];
-        NSString *text = [candidate.string stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (text.length == 0) {
+        if (shotlet_text_of(observation).length == 0) {
             continue;
         }
         CGRect box = observation.boundingBox;
@@ -67,17 +110,17 @@ static NSString *shotlet_join_observations(NSArray<VNRecognizedTextObservation *
         CGFloat tolerance = MAX(box.size.height, line_height) * 0.6;
         if (!has_line || fabs(top - line_top) > tolerance) {
             if (current.count > 0) {
-                [lines addObject:[current componentsJoinedByString:@" "]];
+                [lines addObject:shotlet_join_line(current)];
                 [current removeAllObjects];
             }
             has_line = YES;
             line_top = top;
             line_height = box.size.height;
         }
-        [current addObject:text];
+        [current addObject:observation];
     }
     if (current.count > 0) {
-        [lines addObject:[current componentsJoinedByString:@" "]];
+        [lines addObject:shotlet_join_line(current)];
     }
     return [lines componentsJoinedByString:@"\n"];
 }

@@ -167,6 +167,10 @@ pub fn content_size(state: &AppState, label: &str) -> Option<(u32, u32)> {
     book(state).slots.get(label).and_then(|slot| slot.cut.map(|cut| (cut.width.max(1), cut.height.max(1))))
 }
 
+pub fn live_files(state: &AppState) -> Vec<PathBuf> {
+    book(state).slots.values().filter_map(|slot| slot.file.clone()).collect()
+}
+
 pub fn file_path(state: &AppState, id: &str) -> Result<String, String> {
     book(state)
         .slots

@@ -1,9 +1,11 @@
 mod windows_list;
 
 use image::{imageops, RgbaImage};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use xcap::Monitor;
 
 use shotlet_platform::{err, new_id, trace, write_frozen};
@@ -165,7 +167,105 @@ fn store_preview(cache: &mut PreviewCache, key: String, image: Arc<RgbaImage>) {
     while cache.order.len() > 6 {
         if let Some(old) = cache.order.pop_front() {
             cache.images.remove(&old);
+            forget_preview_file(&old);
         }
+    }
+}
+
+/// Drop cached pixels. The freeze files stay until eviction or the startup sweep,
+/// because a crop can still be reading the one that was just taken.
+pub fn release_previews() {
+    if let Ok(mut cache) = preview_cache().lock() {
+        cache.images.clear();
+        cache.order.clear();
+    }
+}
+
+fn forget_preview_file(key: &str) {
+    let path = std::path::Path::new(key);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    if name.starts_with("freeze-") && name.ends_with(".shot") {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Delete capture temps older than six hours. `keep` is the pin files still on screen.
+pub fn sweep_temp_files(keep: &[PathBuf]) {
+    let dir = capture_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let max_age = Duration::from_secs(6 * 60 * 60);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.iter().any(|kept| kept == &path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let temporary = (name.starts_with("freeze-") && name.ends_with(".shot"))
+            || (name.starts_with("scroll-") && name.ends_with(".png"))
+            || (name.starts_with("pin-") && name.ends_with(".png"));
+        if !temporary {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > max_age {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn monitors_cached() -> Result<Vec<Monitor>, String> {
+    thread_local! {
+        static CACHED: RefCell<Option<(Instant, Vec<Monitor>)>> = RefCell::new(None);
+    }
+    CACHED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((stamp, monitors)) = slot.as_ref() {
+            if stamp.elapsed() < Duration::from_secs(2) {
+                return Ok(monitors.clone());
+            }
+        }
+        let monitors = Monitor::all().map_err(err)?;
+        *slot = Some((Instant::now(), monitors.clone()));
+        Ok(monitors)
+    })
+}
+
+fn blit_rgba(canvas: &mut RgbaImage, shot: &RgbaImage, dest_x: i64, dest_y: i64) {
+    let canvas_w = i64::from(canvas.width());
+    let canvas_h = i64::from(canvas.height());
+    let shot_w = i64::from(shot.width());
+    let shot_h = i64::from(shot.height());
+    let x0 = dest_x.max(0);
+    let y0 = dest_y.max(0);
+    let x1 = (dest_x + shot_w).min(canvas_w);
+    let y1 = (dest_y + shot_h).min(canvas_h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let src_x = (x0 - dest_x) as usize;
+    let copy_bytes = ((x1 - x0) as usize) * 4;
+    let shot_stride = (shot.width() as usize) * 4;
+    let canvas_stride = (canvas.width() as usize) * 4;
+    let shot_raw = shot.as_raw();
+    let canvas_raw = canvas.as_mut();
+    for row in 0..(y1 - y0) as usize {
+        let sy = (y0 - dest_y) as usize + row;
+        let dy = y0 as usize + row;
+        let src_off = sy * shot_stride + src_x * 4;
+        let dst_off = dy * canvas_stride + (x0 as usize) * 4;
+        canvas_raw[dst_off..dst_off + copy_bytes].copy_from_slice(&shot_raw[src_off..src_off + copy_bytes]);
     }
 }
 
@@ -403,7 +503,7 @@ pub fn crop_screens(screens: &[ScreenImage], x: i32, y: i32, width: u32, height:
         }
         let image = cached_screen(&screen.path)?;
         let piece = crop_frozen(&image, x0 - screen.x, y0 - screen.y, (x1 - x0) as u32, (y1 - y0) as u32)?;
-        imageops::overlay(&mut canvas, &piece, (x0 - x) as i64, (y0 - y) as i64);
+        blit_rgba(&mut canvas, &piece, (x0 - x) as i64, (y0 - y) as i64);
         hit = true;
     }
     if !hit {
@@ -536,7 +636,7 @@ pub fn capture_local(screen_x: i32, screen_y: i32, x: u32, y: u32, width: u32, h
     if width == 0 || height == 0 {
         return Err("选区尺寸无效".into());
     }
-    let monitors = Monitor::all().map_err(err)?;
+    let monitors = monitors_cached()?;
     let os = cursor_space_monitors();
     for monitor in monitors {
         let Ok(mx) = monitor.x() else { continue };
@@ -567,11 +667,20 @@ pub fn capture_rect(x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage
     if width == 0 || height == 0 || width > 16000 || height > 16000 {
         return Err("选区尺寸无效".into());
     }
-    let monitors = Monitor::all().map_err(err)?;
-    let mut canvas = RgbaImage::new(width, height);
+    let monitors = monitors_cached()?;
     let right = x.saturating_add(width as i32);
     let bottom = y.saturating_add(height as i32);
-    for monitor in monitors {
+    struct Hit {
+        index: usize,
+        mx: i32,
+        my: i32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    }
+    let mut hits = Vec::new();
+    for (index, monitor) in monitors.iter().enumerate() {
         let mx = monitor.x().map_err(err)?;
         let my = monitor.y().map_err(err)?;
         let mw = monitor.width().map_err(err)? as i32;
@@ -583,15 +692,26 @@ pub fn capture_rect(x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        let shot = monitor
+        hits.push(Hit { index, mx, my, x0, y0, x1, y1 });
+    }
+    if let [hit] = hits.as_slice() {
+        if hit.x0 == x && hit.y0 == y && hit.x1 == right && hit.y1 == bottom {
+            return monitors[hit.index]
+                .capture_region((x - hit.mx) as u32, (y - hit.my) as u32, width, height)
+                .map_err(err);
+        }
+    }
+    let mut canvas = RgbaImage::new(width, height);
+    for hit in hits {
+        let shot = monitors[hit.index]
             .capture_region(
-                (x0 - mx) as u32,
-                (y0 - my) as u32,
-                (x1 - x0) as u32,
-                (y1 - y0) as u32,
+                (hit.x0 - hit.mx) as u32,
+                (hit.y0 - hit.my) as u32,
+                (hit.x1 - hit.x0) as u32,
+                (hit.y1 - hit.y0) as u32,
             )
             .map_err(err)?;
-        imageops::overlay(&mut canvas, &shot, (x0 - x) as i64, (y0 - y) as i64);
+        blit_rgba(&mut canvas, &shot, (hit.x0 - x) as i64, (hit.y0 - y) as i64);
     }
     Ok(canvas)
 }

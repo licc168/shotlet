@@ -1,6 +1,6 @@
 use gif::{Encoder, Frame, Repeat};
 use image::RgbaImage;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -23,6 +23,7 @@ pub fn limit_ms() -> u64 {
 
 pub struct Recorder {
     stop: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     frames: Arc<AtomicU32>,
     elapsed: Arc<AtomicU64>,
@@ -67,9 +68,19 @@ pub fn set_paused(recorder: &Recorder, paused: bool) {
 }
 
 pub fn cancel(recorder: &mut Recorder) {
-    recorder.stop.store(true, Ordering::Relaxed);
+    // Release pairs with the capture thread's Acquire loads. On Apple Silicon a
+    // relaxed store of `cancelled` can stay invisible after `stop` is already seen,
+    // so a cancel would still mix and save the file.
+    recorder.cancelled.store(true, Ordering::Release);
+    recorder.stop.store(true, Ordering::Release);
     if let Some(thread) = recorder.thread.take() {
         let _ = thread.join();
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        cancel(self);
     }
 }
 
@@ -128,11 +139,13 @@ pub fn start(
     }
     let (width, height) = fit_size(width, height, request.format == "mp4")?;
     let stop = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(AtomicBool::new(false));
     let frames = Arc::new(AtomicU32::new(0));
     let elapsed = Arc::new(AtomicU64::new(0));
     let message = Arc::new(Mutex::new(String::new()));
     let stop_thread = stop.clone();
+    let cancelled_thread = cancelled.clone();
     let pause_thread = pause.clone();
     let frames_thread = frames.clone();
     let elapsed_thread = elapsed.clone();
@@ -145,6 +158,7 @@ pub fn start(
             height,
             &request,
             &stop_thread,
+            &cancelled_thread,
             &pause_thread,
             &frames_thread,
             &elapsed_thread,
@@ -159,6 +173,7 @@ pub fn start(
     });
     Ok(Recorder {
         stop,
+        cancelled,
         pause,
         frames,
         elapsed,
@@ -170,7 +185,7 @@ pub fn start(
 }
 
 pub fn finish(recorder: &mut Recorder) -> Result<PathBuf, String> {
-    recorder.stop.store(true, Ordering::Relaxed);
+    recorder.stop.store(true, Ordering::Release);
     let thread = recorder.thread.take().ok_or("录制线程已经结束")?;
     thread.join().map_err(|_| "录制线程异常退出".to_string())?
 }
@@ -202,6 +217,7 @@ fn record_loop(
     height: u32,
     request: &Request,
     stop: &Arc<AtomicBool>,
+    cancelled: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     frames: &Arc<AtomicU32>,
     elapsed: &Arc<AtomicU64>,
@@ -212,10 +228,19 @@ fn record_loop(
     let captures = start_audio(request, &dir, &id, pause, message);
     let expect_audio = !captures.is_empty();
     let video = if request.format == "mp4" {
-        record_mp4(&dir, &id, x, y, width, height, request.cursor, expect_audio, stop, pause, frames, elapsed, message)
+        record_mp4(&dir, &id, x, y, width, height, request.cursor, expect_audio, stop, pause, frames, elapsed, message, cancelled)
     } else {
         record_gif(&dir, &id, x, y, width, height, request.cursor, stop, pause, frames, elapsed, message)
     };
+    if cancelled.load(Ordering::Acquire) {
+        if let Ok(path) = &video {
+            let _ = std::fs::remove_file(path);
+        }
+        for wav in finish_audio(captures, message) {
+            let _ = std::fs::remove_file(wav);
+        }
+        return Err("已取消".into());
+    }
     let wavs = finish_audio(captures, message);
     let path = match video {
         Ok(path) => path,
@@ -304,7 +329,7 @@ fn capture_until(
     mut write: impl FnMut(&RgbaImage) -> Result<(), String>,
 ) -> Result<(), String> {
     loop {
-        if pace.stop.load(Ordering::Relaxed) || pace.active >= LIMIT {
+        if pace.stop.load(Ordering::Acquire) || pace.active >= LIMIT {
             return Ok(());
         }
         if pace.pause.load(Ordering::Relaxed) {
@@ -394,19 +419,28 @@ fn record_mp4(
     frames: &Arc<AtomicU32>,
     elapsed: &Arc<AtomicU64>,
     message: &Mutex<String>,
+    cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     let path = if silent_name {
         dir.join(format!("shotlet-{id}.silent.mp4"))
     } else {
         dir.join(format!("shotlet-{id}.mp4"))
     };
-    let (child, mut stdin) = spawn_ffmpeg(&path, width, height)?;
+    let (mut child, mut stdin, stderr) = spawn_ffmpeg(&path, width, height)?;
     let mut pace = Pace { interval: MP4_INTERVAL, stop, pause, frames, elapsed, active: Duration::ZERO, misses: 0 };
     let written = capture_until(x, y, width, height, cursor, &mut pace, message, |frame| {
         stdin.write_all(frame.as_raw()).map_err(err)
     });
     drop(stdin);
-    let encoded = wait_ffmpeg(child, "ffmpeg 编码失败");
+    if cancelled.load(Ordering::Acquire) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr.join();
+        let _ = std::fs::remove_file(&path);
+        let _ = written;
+        return Err("已取消".into());
+    }
+    let encoded = finish_ffmpeg(child, stderr, "ffmpeg 编码失败");
     if frames.load(Ordering::Relaxed) == 0 {
         let _ = std::fs::remove_file(&path);
         return Err(written.err().unwrap_or_else(|| "没有采集到画面".into()));
@@ -416,12 +450,13 @@ fn record_mp4(
     Ok(path)
 }
 
-fn spawn_ffmpeg(path: &Path, width: u32, height: u32) -> Result<(Child, std::process::ChildStdin), String> {
+fn spawn_ffmpeg(path: &Path, width: u32, height: u32) -> Result<(Child, std::process::ChildStdin, JoinHandle<Vec<u8>>), String> {
     let size = format!("{width}x{height}");
     let output = path.to_string_lossy().to_string();
     let mut child = Command::new("ffmpeg")
         .args([
             "-y",
+            "-loglevel", "error",
             "-f", "rawvideo",
             "-pix_fmt", "rgba",
             "-s", &size,
@@ -439,8 +474,45 @@ fn spawn_ffmpeg(path: &Path, width: u32, height: u32) -> Result<(Child, std::pro
         .stderr(Stdio::piped())
         .spawn()
         .map_err(err)?;
+    let stderr = child.stderr.take().ok_or("无法读取 ffmpeg 日志")?;
+    let stderr_thread = thread::spawn(move || drain_stderr(stderr));
     let stdin = child.stdin.take().ok_or("无法写入 ffmpeg")?;
-    Ok((child, stdin))
+    Ok((child, stdin, stderr_thread))
+}
+
+fn drain_stderr(mut pipe: impl Read) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 8192 {
+                    let extra = buf.len() - 8192;
+                    buf.drain(..extra);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+fn finish_ffmpeg(mut child: Child, stderr_thread: JoinHandle<Vec<u8>>, label: &str) -> Result<(), String> {
+    let status = child.wait().map_err(err)?;
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&stderr);
+    let trimmed = text.trim();
+    let tail: String = trimmed.chars().rev().take(180).collect::<String>().chars().rev().collect();
+    if tail.is_empty() {
+        Err(label.into())
+    } else {
+        Err(format!("{label}：{tail}"))
+    }
 }
 
 fn mux_audio(video: &Path, wavs: &[PathBuf], output: &Path) -> Result<(), String> {
@@ -454,6 +526,7 @@ fn mux_audio(video: &Path, wavs: &[PathBuf], output: &Path) -> Result<(), String
         Command::new("ffmpeg")
             .args([
                 "-y",
+                "-loglevel", "error",
                 "-i", &video_s,
                 "-i", &wav_s,
                 "-map", "0:v:0",
@@ -475,6 +548,7 @@ fn mux_audio(video: &Path, wavs: &[PathBuf], output: &Path) -> Result<(), String
         Command::new("ffmpeg")
             .args([
                 "-y",
+                "-loglevel", "error",
                 "-i", &video_s,
                 "-i", &mic,
                 "-i", &speaker,

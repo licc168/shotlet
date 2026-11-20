@@ -308,14 +308,24 @@ impl Roll {
     }
 
     fn compose(&self) -> RgbaImage {
-        let mut image = self.head.clone();
-        for strip in &self.above {
-            image = prepend_rows(&image, strip);
+        let width = self.head.width();
+        let mut parts: Vec<&RgbaImage> = Vec::new();
+        let mut height = 0u32;
+        for strip in self.above.iter().rev().chain(std::iter::once(&self.head)).chain(self.below.iter()) {
+            if strip.width() != width || strip.height() == 0 {
+                continue;
+            }
+            height = height.saturating_add(strip.height());
+            parts.push(strip);
         }
-        for strip in &self.below {
-            image = append_rows(&image, strip);
+        if parts.is_empty() {
+            return self.head.clone();
         }
-        image
+        let mut raw = Vec::with_capacity((height as usize).saturating_mul(width as usize).saturating_mul(4));
+        for strip in parts {
+            raw.extend_from_slice(strip.as_raw());
+        }
+        RgbaImage::from_raw(width, height, raw).unwrap_or_else(|| self.head.clone())
     }
 }
 
@@ -363,10 +373,11 @@ fn best_shift(prev: &RgbaImage, next: &RgbaImage, downward: bool) -> Option<Shif
     if max_shift < 2 {
         return None;
     }
-    let zero = alignment_cost(prev, next, 0, true).unwrap_or(i64::MAX / 8);
+    let rows = same_row_diffs(prev, next);
+    let zero = alignment_cost(prev, next, 0, true, &rows).unwrap_or(i64::MAX / 8);
     let mut hits = Vec::new();
     for shift in 2..=max_shift {
-        let Some(cost) = alignment_cost(prev, next, shift, downward) else { continue };
+        let Some(cost) = alignment_cost(prev, next, shift, downward, &rows) else { continue };
         hits.push(ShiftHit { shift, cost });
     }
     if hits.is_empty() {
@@ -385,7 +396,11 @@ fn best_shift(prev: &RgbaImage, next: &RgbaImage, downward: bool) -> Option<Shif
     Some(best)
 }
 
-fn alignment_cost(prev: &RgbaImage, next: &RgbaImage, shift: u32, downward: bool) -> Option<i64> {
+fn same_row_diffs(prev: &RgbaImage, next: &RgbaImage) -> Vec<i64> {
+    (0..prev.height()).map(|y| sample_diff(prev, y, next, y)).collect()
+}
+
+fn alignment_cost(prev: &RgbaImage, next: &RgbaImage, shift: u32, downward: bool, rows: &[i64]) -> Option<i64> {
     let height = prev.height();
     let (start, end) = if shift == 0 {
         (0, height)
@@ -408,8 +423,8 @@ fn alignment_cost(prev: &RgbaImage, next: &RgbaImage, shift: u32, downward: bool
         if prev_y >= height {
             break;
         }
-        let here = sample_diff(prev, y, next, y);
-        let there = sample_diff(prev, prev_y, next, prev_y);
+        let here = rows.get(y as usize).copied().unwrap_or(i64::MAX / 4);
+        let there = rows.get(prev_y as usize).copied().unwrap_or(i64::MAX / 4);
         let stationary = here <= 8 && there <= 8;
         if shift != 0 && (here <= 8 || there <= 8) {
             y += step;
@@ -454,7 +469,8 @@ fn sample_diff(prev: &RgbaImage, prev_y: u32, next: &RgbaImage, next_y: u32) -> 
 }
 
 fn describe_shifts(prev: &RgbaImage, next: &RgbaImage, direction: i8) -> String {
-    let zero = alignment_cost(prev, next, 0, true).unwrap_or(-1);
+    let rows = same_row_diffs(prev, next);
+    let zero = alignment_cost(prev, next, 0, true, &rows).unwrap_or(-1);
     let down = if direction != -1 { best_shift(prev, next, true) } else { None };
     let up = if direction != 1 { best_shift(prev, next, false) } else { None };
     format!(

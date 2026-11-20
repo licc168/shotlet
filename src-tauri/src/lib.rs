@@ -100,6 +100,7 @@ pub fn run() {
             }
             ui::begin_follow(app.handle());
             ui::replenish_pin(app.handle());
+            capture::sweep_temp_files(&pin_session::live_files(app.state::<AppState>().inner()));
             Ok(())
         })
         .on_window_event(|window, event| {

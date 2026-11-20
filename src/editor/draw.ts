@@ -24,6 +24,12 @@ export function renderScene(
   const snapshot = paintBase
     ? ctx.getImageData(0, 0, width, height)
     : sampleScene(image, selection, layers, viewScale, width, height);
+  // The preview canvas sits on the photo, so only mosaic blocks stay opaque.
+  // Clear once. Clearing inside each stroke erases the mosaic before it.
+  if (!paintBase) {
+    const pixels = snapshot.data;
+    for (let index = 3; index < pixels.length; index += 4) pixels[index] = 0;
+  }
   for (const layer of mosaics) pixelate(snapshot, layer, selection, viewScale, !paintBase);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (paintBase) {
@@ -222,9 +228,6 @@ function pixelate(snapshot: ImageData, layer: Extract<Layer, { type: "mosaic" }>
   const pixels = snapshot.data;
   const width = snapshot.width;
   const height = snapshot.height;
-  if (isolate) {
-    for (let index = 3; index < pixels.length; index += 4) pixels[index] = 0;
-  }
   const minX = Math.max(0, Math.floor((Math.min(...layer.points.map((point) => point.x)) - layer.radius - selection.x) * viewScale));
   const minY = Math.max(0, Math.floor((Math.min(...layer.points.map((point) => point.y)) - layer.radius - selection.y) * viewScale));
   const maxX = Math.min(width, Math.ceil((Math.max(...layer.points.map((point) => point.x)) + layer.radius - selection.x) * viewScale));

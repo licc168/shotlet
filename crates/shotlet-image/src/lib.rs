@@ -143,18 +143,12 @@ pub fn prepend_rows(base: &RgbaImage, rows: &RgbaImage) -> RgbaImage {
     if rows.height() == 0 || rows.width() != base.width() {
         return base.clone();
     }
-    let mut out = RgbaImage::new(base.width(), rows.height().saturating_add(base.height()));
-    for y in 0..rows.height() {
-        for x in 0..rows.width() {
-            out.put_pixel(x, y, *rows.get_pixel(x, y));
-        }
-    }
-    for y in 0..base.height() {
-        for x in 0..base.width() {
-            out.put_pixel(x, rows.height() + y, *base.get_pixel(x, y));
-        }
-    }
-    out
+    let width = base.width();
+    let height = rows.height().saturating_add(base.height());
+    let mut raw = Vec::with_capacity((height as usize).saturating_mul(width as usize).saturating_mul(4));
+    raw.extend_from_slice(rows.as_raw());
+    raw.extend_from_slice(base.as_raw());
+    RgbaImage::from_raw(width, height, raw).unwrap_or_else(|| base.clone())
 }
 
 /// Append `rows` under `base`. Widths must match; an empty strip leaves `base` unchanged.
@@ -162,18 +156,12 @@ pub fn append_rows(base: &RgbaImage, rows: &RgbaImage) -> RgbaImage {
     if rows.height() == 0 || rows.width() != base.width() {
         return base.clone();
     }
-    let mut out = RgbaImage::new(base.width(), base.height().saturating_add(rows.height()));
-    for y in 0..base.height() {
-        for x in 0..base.width() {
-            out.put_pixel(x, y, *base.get_pixel(x, y));
-        }
-    }
-    for y in 0..rows.height() {
-        for x in 0..rows.width() {
-            out.put_pixel(x, base.height() + y, *rows.get_pixel(x, y));
-        }
-    }
-    out
+    let width = base.width();
+    let height = base.height().saturating_add(rows.height());
+    let mut raw = Vec::with_capacity((height as usize).saturating_mul(width as usize).saturating_mul(4));
+    raw.extend_from_slice(base.as_raw());
+    raw.extend_from_slice(rows.as_raw());
+    RgbaImage::from_raw(width, height, raw).unwrap_or_else(|| base.clone())
 }
 
 struct ShiftScore {

@@ -331,7 +331,7 @@ fn validate_shortcut(text: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub fn list_history(app: AppHandle, query: String, filter: String) -> Result<Vec<HistoryItem>, String> {
-    Ok(library::list(&storage(&app)?, &query, &filter))
+    library::list(&storage(&app)?, &query, &filter)
 }
 
 #[tauri::command]
@@ -385,8 +385,10 @@ pub fn copy_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn write_png_base64(data: String, dest: String) -> Result<(), String> {
-    library::write_png_base64(&data, Path::new(&dest))
+pub async fn write_png_base64(data: String, dest: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || library::write_png_base64(&data, Path::new(&dest)))
+        .await
+        .map_err(err)?
 }
 
 #[tauri::command]
@@ -409,10 +411,13 @@ fn round_i32(value: f64) -> i32 {
 }
 
 #[tauri::command]
-pub fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<(), String> {
+pub async fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<(), String> {
     let x = round_i32(x);
     let y = round_i32(y);
-    let (width, height) = library::image_size(Path::new(&path))?;
+    let sized = path.clone();
+    let (width, height) = tauri::async_runtime::spawn_blocking(move || library::image_size(Path::new(&sized)))
+        .await
+        .map_err(err)??;
     eprintln!("pin: file {path} at {x},{y} ({width}x{height})");
     let _ = ui::open_pin(&app, path, x, y, width, height)?;
     Ok(())
@@ -591,8 +596,15 @@ pub fn pin_history(app: AppHandle, id: String, document: String) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn copy_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
-    library::copy_capture_region(&app.state::<AppState>(), &storage(&app)?, x, y, width, height)?;
+pub async fn copy_capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    let root = storage(&app)?;
+    let state_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = state_app.state::<AppState>();
+        library::copy_capture_region(&state, &root, x, y, width, height)
+    })
+    .await
+    .map_err(err)??;
     let _ = app.emit("capture-error", "已复制截图");
     Ok(())
 }
@@ -648,8 +660,10 @@ pub fn pin_path(state: State<AppState>, id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
-    let bytes = library::read_image_bytes(Path::new(&path))?;
+pub async fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || library::read_image_bytes(Path::new(&path)))
+        .await
+        .map_err(err)??;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -723,8 +737,11 @@ pub async fn scroll_capture(app: AppHandle, request: ScrollRequest) -> Result<Ed
             return Err(error);
         }
     };
-    std::thread::sleep(std::time::Duration::from_millis(160));
-    let captured = tauri::async_runtime::spawn_blocking(move || scroll_session::capture(frame)).await;
+    let captured = tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        scroll_session::capture(frame)
+    })
+    .await;
     scroll_session::end();
     let _ = ui::on_main_wait_for(&app, std::time::Duration::from_secs(4), |app| ui::close_scroll_chrome(app));
     let result = match captured.map_err(err).and_then(|inner| inner) {
@@ -748,7 +765,13 @@ pub async fn scroll_capture(app: AppHandle, request: ScrollRequest) -> Result<Ed
         return Ok(view);
     }
     if action == "save" {
-        if let Some(dest) = save_long_image(&app) {
+        let dialog_app = app.clone();
+        let dest = tauri::async_runtime::spawn_blocking(move || save_long_image(dialog_app))
+            .await
+            .map_err(err)
+            .ok()
+            .flatten();
+        if let Some(dest) = dest {
             std::fs::copy(&path, &dest).map_err(err)?;
             ui::close_overlay(&app);
             let _ = app.emit("capture-error", "已保存长图");
@@ -763,15 +786,26 @@ pub async fn scroll_capture(app: AppHandle, request: ScrollRequest) -> Result<Ed
     Ok(view)
 }
 
-fn save_long_image(app: &AppHandle) -> Option<PathBuf> {
-    let file = app
-        .dialog()
-        .file()
-        .add_filter("PNG", &["png"])
-        .set_file_name("shotlet-scroll.png")
-        .set_title("保存长图")
-        .blocking_save_file()?;
-    file.into_path().ok()
+fn save_long_image(app: AppHandle) -> Option<PathBuf> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dialog_app = app.clone();
+    if app
+        .run_on_main_thread(move || {
+            dialog_app
+                .dialog()
+                .file()
+                .add_filter("PNG", &["png"])
+                .set_file_name("shotlet-scroll.png")
+                .set_title("保存长图")
+                .save_file(move |file| {
+                    let _ = tx.send(file.and_then(|path| path.into_path().ok()));
+                });
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv_timeout(std::time::Duration::from_secs(8)).ok().flatten()
 }
 
 #[tauri::command]
@@ -863,5 +897,9 @@ pub fn storage_dir(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
-    app.opener().open_path(path, None::<&str>).map_err(err)
+    let file = Path::new(&path);
+    if !file.exists() {
+        return Err("找不到文件".into());
+    }
+    app.opener().reveal_item_in_dir(file).map_err(err)
 }

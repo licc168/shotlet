@@ -17,7 +17,7 @@ fn compile_macos_helpers() {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let arch = macos_clang_arch();
     let mut objects = Vec::new();
-    for name in ["ocr_mac.m", "scroll_mac.m"] {
+    for name in ["ocr_mac.m"] {
         let source = manifest.join("macos").join(name);
         println!("cargo:rerun-if-changed={}", source.display());
         let object = out_dir.join(name.replace(".m", ".o"));

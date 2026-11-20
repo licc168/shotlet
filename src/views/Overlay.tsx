@@ -67,6 +67,12 @@ export function Overlay() {
       ownsFollow.current = false;
       drag.current = null;
       draftRef.current = null;
+      copying.current = false;
+      scrolling.current = false;
+      cancelAnimationFrame(raf.current);
+      raf.current = 0;
+      stopDragListen.current?.();
+      stopDragListen.current = null;
       setDraft(null);
       setCursor(null);
       setCapture(null);
@@ -331,9 +337,10 @@ export function Overlay() {
       await cancelCapture();
       return true;
     } catch (reason: unknown) {
-      copying.current = false;
       setError(reason instanceof Error ? reason.message : String(reason));
       return false;
+    } finally {
+      copying.current = false;
     }
   }
 

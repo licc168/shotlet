@@ -1,7 +1,8 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -22,6 +23,18 @@ const OVERLAY: &str = "overlay";
 /// focus, which a borderless show often does not get.
 static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
 static OVERLAY_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+/// Open flag and the follower's park. The flag is written while the mutex is held
+/// so a close cannot be missed between the check and the wait.
+static OVERLAY_WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+fn set_overlay_open(open: bool) {
+    let mut flag = OVERLAY_WAKE.0.lock().unwrap_or_else(|error| error.into_inner());
+    OVERLAY_OPEN.store(open, Ordering::Relaxed);
+    *flag = open;
+    if open {
+        OVERLAY_WAKE.1.notify_all();
+    }
+}
 
 /// `SHOTLET_OVERLAY_CLOAK=0` keeps the old show/hide path. macOS always does.
 pub fn overlay_uses_cloak() -> bool {
@@ -161,6 +174,26 @@ pub fn view_url(query: &str) -> WebviewUrl {
     }
 }
 
+thread_local! {
+    static MAIN_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+fn on_main_thread() -> bool {
+    MAIN_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn with_main_depth<T>(task: impl FnOnce() -> T) -> T {
+    MAIN_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            MAIN_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    let _guard = Guard;
+    task()
+}
+
 fn on_main(app: &AppHandle, task: impl FnOnce(&AppHandle) + Send + 'static) -> Result<(), String> {
     let app = app.clone();
     // Already-on-main-thread callbacks run inline. Creating a WebView2 window from
@@ -169,7 +202,9 @@ fn on_main(app: &AppHandle, task: impl FnOnce(&AppHandle) + Send + 'static) -> R
     // another thread so it runs on a later turn of the event loop.
     std::thread::spawn(move || {
         let app_for_task = app.clone();
-        let _ = app.run_on_main_thread(move || task(&app_for_task));
+        let _ = app.run_on_main_thread(move || {
+            with_main_depth(|| task(&app_for_task));
+        });
     });
     Ok(())
 }
@@ -186,11 +221,16 @@ pub fn on_main_wait_for<T: Send + 'static>(
     timeout: Duration,
     task: impl FnOnce(&AppHandle) -> T + Send + 'static,
 ) -> Result<T, String> {
+    // Nested calls happen when a main-thread callback opens another window.
+    // Queueing again and then waiting would block the event loop until timeout.
+    if on_main_thread() {
+        return Ok(with_main_depth(|| task(app)));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let app = app.clone();
     app.clone()
         .run_on_main_thread(move || {
-            let _ = tx.send(task(&app));
+            let _ = tx.send(with_main_depth(|| task(&app)));
         })
         .map_err(err)?;
     rx.recv_timeout(timeout).map_err(|_| "界面线程没有响应".to_string())
@@ -373,7 +413,7 @@ pub fn present_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64
         }
     }
     hide_extra_overlays(app, places.len());
-    OVERLAY_OPEN.store(true, Ordering::Relaxed);
+    set_overlay_open(true);
     let aim = (frozen.origin_x, frozen.origin_y);
     for (slot, place) in places.iter().enumerate() {
         let armed = place.x == aim.0 && place.y == aim.1;
@@ -772,7 +812,17 @@ fn follow_loop(app: AppHandle) {
     static FOCUSING: AtomicBool = AtomicBool::new(false);
     let mut escape_was_down = false;
     loop {
+        {
+            let mut open = OVERLAY_WAKE.0.lock().unwrap_or_else(|error| error.into_inner());
+            while !*open {
+                open = OVERLAY_WAKE.1.wait(open).unwrap_or_else(|error| error.into_inner());
+            }
+        }
         std::thread::sleep(Duration::from_millis(16));
+        if !OVERLAY_OPEN.load(Ordering::Relaxed) {
+            escape_was_down = false;
+            continue;
+        }
         let escape_down = escape_key_down();
         let escape_hit = escape_down && !escape_was_down;
         escape_was_down = escape_down;
@@ -885,7 +935,8 @@ pub fn close_overlay(app: &AppHandle) {
 }
 
 fn dismiss_overlay(app: &AppHandle) {
-    OVERLAY_OPEN.store(false, Ordering::Relaxed);
+    set_overlay_open(false);
+    capture::release_previews();
     if let Ok(mut slot) = OVERLAY_HWNDS.lock() {
         slot.clear();
     }

@@ -32,7 +32,7 @@ pub fn ensure_dir(app_data: &Path, settings: &Settings) -> Result<PathBuf, Strin
     Ok(root)
 }
 
-pub fn list(root: &Path, query: &str, filter: &str) -> Vec<HistoryItem> {
+pub fn list(root: &Path, query: &str, filter: &str) -> Result<Vec<HistoryItem>, String> {
     history::list(root, query, filter)
 }
 
@@ -77,7 +77,7 @@ pub fn save_settings(app_data: &Path, settings: &Settings) -> Result<(), String>
 }
 
 pub fn copy_latest(root: &Path) -> Result<LatestCopy, String> {
-    let Some(path) = history::latest_file(root) else {
+    let Some(path) = history::latest_file(root)? else {
         return Ok(LatestCopy::Empty);
     };
     copy_png_file(Path::new(&path))?;
@@ -95,8 +95,16 @@ pub fn copy_png_file(path: &Path) -> Result<(), String> {
 }
 
 pub fn write_png_base64(data: &str, dest: &Path) -> Result<(), String> {
-    let image = util::load_rgba(&util::decode_png(data)?)?;
-    util::write_png(dest, &image)
+    if !dest.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+        return Err("只能保存为 PNG".into());
+    }
+    let bytes = util::decode_png(data)?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        util::write_bytes(dest, &bytes)
+    } else {
+        let image = util::load_rgba(&bytes)?;
+        util::write_png(dest, &image)
+    }
 }
 
 pub fn copy_png_base64(data: &str) -> Result<(), String> {
@@ -158,8 +166,11 @@ pub fn copy_capture_region(state: &AppState, root: &Path, x: i32, y: i32, width:
 }
 
 pub fn image_size(path: &Path) -> Result<(u32, u32), String> {
-    let image = util::read_png_file(path)?;
-    Ok((image.width(), image.height()))
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(err)?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).map_err(err)?;
+    util::png_size(&header)
 }
 
 pub fn write_pin_png(data: &str) -> Result<(PathBuf, u32, u32), String> {
@@ -348,6 +359,10 @@ pub fn read_image_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path).map_err(err)?;
     if !meta.is_file() {
         return Err("找不到截图".into());
+    }
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "shot") {
+        return Err("不支持的图片".into());
     }
     // Full-screen retina captures stay well under this. Reject anything else
     // before it is copied into the webview.

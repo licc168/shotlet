@@ -14,12 +14,16 @@ export function Editor() {
   const [error, setError] = useState("");
   const sourcePath = useRef("");
   const fileBacked = useRef(true);
+  const labels = useRef(t);
+  labels.current = t;
 
   useEffect(() => {
+    let dead = false;
     const id = new URLSearchParams(location.search).get("id");
     currentEditor(id).then(async (payload) => {
+      if (dead) return;
       if (!payload) {
-        setError(t("empty"));
+        setError(labels.current("empty"));
         return;
       }
       sourcePath.current = payload.path;
@@ -27,8 +31,13 @@ export function Editor() {
       setRecordId(payload.recordId);
       setDocumentText(payload.document);
       setImage(await loadImage(payload.path));
-    }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
-  }, [t]);
+    }).catch((reason: unknown) => {
+      if (!dead) setError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => {
+      dead = true;
+    };
+  }, []);
 
   if (!image) return <main className="home"><p>{error || t("busy")}</p></main>;
 
