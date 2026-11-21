@@ -299,7 +299,9 @@ export function renderRgba(image: CanvasImageSource, selection: Rect, layers: La
   return { pixels: frame.data, width: canvas.width, height: canvas.height };
 }
 
-export async function renderPng(image: CanvasImageSource, selection: Rect, layers: Layer[], annotate: boolean): Promise<string> {
+export type RenderedPng = { base64: string; bytes: Uint8Array<ArrayBuffer> };
+
+export async function renderPng(image: CanvasImageSource, selection: Rect, layers: Layer[], annotate: boolean): Promise<RenderedPng> {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("canvas");
@@ -312,5 +314,5 @@ export async function renderPng(image: CanvasImageSource, selection: Rect, layer
   for (let index = 0; index < bytes.length; index += chunk) {
     binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
   }
-  return btoa(binary);
+  return { base64: btoa(binary), bytes };
 }

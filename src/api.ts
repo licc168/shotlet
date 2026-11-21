@@ -1,4 +1,4 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { defaultSettings, type CommitBody, type EditorPayload, type FrozenCapture, type HistoryItem, type Settings } from "./types";
 
 /** A decoded screenshot. An image element or a canvas that already holds the captured pixels. */
@@ -6,6 +6,8 @@ export type ShotImage = CanvasImageSource & {
   naturalWidth: number;
   naturalHeight: number;
   src: string;
+  /** Raw RGBA when available (binary IPC path), so colour sampling is O(1) and GPU-free. */
+  pixels?: Uint8ClampedArray<ArrayBuffer>;
 };
 
 const SETTINGS_KEY = "shotlet.settings";
@@ -21,7 +23,6 @@ export function imageSrc(path: string): string {
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(command, args);
 }
 
@@ -177,6 +178,64 @@ export async function updateHistory(id: string, request: CommitBody): Promise<Hi
   return call<HistoryItem>("update_history", { id, request });
 }
 
+/** Metadata carried in the binary commit frame; the images travel as raw bytes. */
+type CommitMeta = {
+  document: string;
+  ocrText: string;
+  width: number;
+  height: number;
+  name: string;
+  id?: string;
+};
+
+/**
+ * A raw IPC body can hold only one blob, so pack both PNGs and the metadata
+ * into a single self-describing frame:
+ *   [u32 png len][u32 base len][u32 meta len][png][base][meta JSON]
+ */
+function commitFrame(meta: CommitMeta, png: Uint8Array<ArrayBuffer>, base: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+  const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
+  const out = new Uint8Array(12 + png.length + base.length + metaBytes.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, png.length, true);
+  view.setUint32(4, base.length, true);
+  view.setUint32(8, metaBytes.length, true);
+  out.set(png, 12);
+  out.set(base, 12 + png.length);
+  out.set(metaBytes, 12 + png.length + base.length);
+  return out;
+}
+
+function commitMeta(request: CommitBody): CommitMeta {
+  return {
+    document: request.document,
+    ocrText: request.ocrText,
+    width: request.width,
+    height: request.height,
+    name: request.name,
+  };
+}
+
+/** Commit with raw PNG bytes. Browser demos fall back to the Base64 request. */
+export async function commitHistoryRaw(
+  request: CommitBody,
+  png: Uint8Array<ArrayBuffer>,
+  base: Uint8Array<ArrayBuffer>,
+): Promise<HistoryItem> {
+  if (!isTauri()) return commitHistory(request);
+  return invoke<HistoryItem>("commit_history_raw", commitFrame(commitMeta(request), png, base));
+}
+
+export async function updateHistoryRaw(
+  id: string,
+  request: CommitBody,
+  png: Uint8Array<ArrayBuffer>,
+  base: Uint8Array<ArrayBuffer>,
+): Promise<HistoryItem> {
+  if (!isTauri()) return updateHistory(id, request);
+  return invoke<HistoryItem>("update_history_raw", commitFrame({ ...commitMeta(request), id }, png, base));
+}
+
 async function patch(id: string, change: (item: HistoryItem) => void): Promise<void> {
   const items = readHistory();
   const item = items.find((entry) => entry.id === id);
@@ -233,6 +292,28 @@ export async function exportCaptures(ids: string[], destDir: string): Promise<nu
 export async function copyFile(path: string): Promise<void> {
   if (!isTauri()) return copyPngBase64(await fileToBase64(path));
   await call("copy_file", { path });
+}
+
+/** Copy an annotated shot with raw PNG bytes; no Base64 encode or decode. */
+export async function copyAnnotatedRaw(
+  png: string,
+  document: string,
+  pngBytes: Uint8Array<ArrayBuffer>,
+  baseBytes: Uint8Array<ArrayBuffer>,
+): Promise<void> {
+  if (!isTauri()) {
+    await copyPngBase64(png);
+    return;
+  }
+  await invoke("copy_annotated_raw", commitFrame({ document, ocrText: "", width: 0, height: 0, name: "" }, pngBytes, baseBytes));
+}
+
+export async function copyPngRaw(data: string, bytes: Uint8Array<ArrayBuffer>): Promise<void> {
+  if (!isTauri()) {
+    await copyPngBase64(data);
+    return;
+  }
+  await invoke("copy_png_raw", bytes);
 }
 
 export async function copyAnnotated(png: string, base: string, document: string): Promise<void> {
@@ -311,7 +392,6 @@ export type PinPlace = {
 export async function pinAnnotatedRgba(pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, place: PinPlace): Promise<string> {
   tracePage("pin: annotated rgba");
   if (!isTauri()) return "";
-  const { invoke } = await import("@tauri-apps/api/core");
   const body = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
   return invoke<string>("pin_annotated", body, {
     headers: {
@@ -422,6 +502,39 @@ export function tracePage(stage: string) {
 export async function ocrPngBase64(data: string): Promise<string> {
   if (!isTauri()) return "Shotlet";
   return call<string>("ocr_png_base64", { data });
+}
+
+/** OCR a PNG without a Base64 round trip. The body is raw PNG bytes. */
+export async function ocrPng(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  if (!isTauri()) return "Shotlet";
+  return invoke<string>("ocr_png_raw", bytes);
+}
+
+function base64Utf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x4000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x4000));
+  }
+  return btoa(binary);
+}
+
+/** Save raw PNG bytes to a path; the destination travels in a header. */
+export async function writePng(bytes: Uint8Array<ArrayBuffer>, dest: string): Promise<void> {
+  if (!isTauri()) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = dest || "shotlet.png";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    return;
+  }
+  await invoke("write_png_raw", bytes, {
+    headers: {
+      "x-write-dest": base64Utf8(dest),
+    },
+  });
 }
 
 export async function openHistory(): Promise<void> {
@@ -629,17 +742,17 @@ export async function loadFrozen(path: string, width: number, height: number): P
   shot.naturalWidth = width;
   shot.naturalHeight = height;
   shot.src = "";
+  shot.pixels = pixels;
   return shot;
 }
 
 export function loadImage(path: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image();
-    image.onload = () => {
-      const src = image.src;
-      resolve(image);
-      if (src.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(src), 60_000);
-    };
+    // The blob URL stays valid for the lifetime of the document. Revoking it on
+    // a timer made editors that outlived the timeout show a broken image. The
+    // URL is released when the document unloads.
+    image.onload = () => resolve(image);
     image.onerror = () => reject(new Error("image"));
     // macOS serves local captures through asset://. Drawing that URL taints the
     // canvas, so color sampling and OCR export fail with SecurityError. Read the

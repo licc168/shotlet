@@ -11,10 +11,18 @@ export function Home() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    listHistory("", "all").then((rows) => setItems(rows.slice(0, 6))).catch(() => setItems([]));
-    let stop = () => undefined as void;
-    onEvent<string>("capture-error", setMessage).then((unlisten) => { stop = unlisten; }).catch(() => undefined);
-    return () => stop();
+    let cancel = false;
+    let stop: (() => void) | undefined;
+    listHistory("", "all")
+      .then((rows) => { if (!cancel) setItems(rows.slice(0, 6)); })
+      .catch(() => { if (!cancel) setItems([]); });
+    onEvent<string>("capture-error", (message) => { if (!cancel) setMessage(message); })
+      .then((unlisten) => { if (cancel) unlisten(); else stop = unlisten; })
+      .catch(() => undefined);
+    return () => {
+      cancel = true;
+      stop?.();
+    };
   }, []);
 
   const captureKeys = shortcutKeys(settings.captureShortcut);
@@ -43,6 +51,7 @@ export function Home() {
           </span>
         )}
       </button>
+      {message && <p className="note">{message}</p>}
       <section className="recent">
         <div className="recent-head">
           <h2>{t("recent")}</h2>
@@ -65,7 +74,6 @@ export function Home() {
           </div>
         )}
       </section>
-      {message && <p className="note">{message}</p>}
       <footer>{t("tray")}</footer>
     </main>
   );

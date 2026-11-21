@@ -4454,8 +4454,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shotlet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "dirs",
  "serde",
@@ -4471,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "shotlet-capture"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "image",
  "shotlet-platform",
@@ -4482,7 +4483,7 @@ dependencies = [
 
 [[package]]
 name = "shotlet-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.23.1",
  "image",
@@ -4495,14 +4496,14 @@ dependencies = [
 
 [[package]]
 name = "shotlet-image"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "image",
 ]
 
 [[package]]
 name = "shotlet-media"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "gif",
@@ -4515,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "shotlet-platform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arboard",
  "base64 0.23.1",
@@ -4526,7 +4527,7 @@ dependencies = [
 
 [[package]]
 name = "shotlet-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "image",
@@ -4538,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "shotlet-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
 ]

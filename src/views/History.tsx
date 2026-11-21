@@ -6,19 +6,29 @@ import type { HistoryItem } from "../types";
 export function History() {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [layout, setLayout] = useState<"grid" | "list">("grid");
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [message, setMessage] = useState("");
 
-  async function reload() {
-    setItems(await listHistory(query, filter));
+  async function reload(term = query) {
+    setItems(await listHistory(term, filter));
   }
 
   useEffect(() => {
-    reload().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
-  }, [query, filter]);
+    const timer = window.setTimeout(() => setDebouncedQuery(query), 200);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    let cancel = false;
+    listHistory(debouncedQuery, filter)
+      .then((rows) => { if (!cancel) setItems(rows); })
+      .catch((error: unknown) => { if (!cancel) setMessage(error instanceof Error ? error.message : String(error)); });
+    return () => { cancel = true; };
+  }, [debouncedQuery, filter]);
 
   const current = items.find((item) => item.id === selected[selected.length - 1]);
 
@@ -60,7 +70,7 @@ export function History() {
       <div className={layout === "grid" ? "cards" : "rows"}>
         {items.map((item) => (
           <article key={item.id} className={selected.includes(item.id) ? "on" : ""} onClick={(event) => toggle(item.id, event)}>
-            <img src={imageSrc(item.file)} alt="" />
+            <img src={imageSrc(item.file)} alt="" loading="lazy" decoding="async" />
             <div>
               <strong>{item.name}</strong>
               <span>{item.tags.join(", ")}</span>

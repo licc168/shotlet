@@ -2,7 +2,19 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Shotlet windows can use capture, files, and window controls.",
-  "windows": ["*"],
+  "windows": [
+    "main",
+    "overlay",
+    "overlay-*",
+    "pin-*",
+    "history",
+    "settings",
+    "editor",
+    "recorder",
+    "scroll-frame",
+    "scroll-hud",
+    "record-border"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

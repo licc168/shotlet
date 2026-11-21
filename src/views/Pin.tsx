@@ -29,6 +29,8 @@ export function Pin() {
   const lastClickRef = useRef<ClickStamp | null>(null);
   const revealedRef = useRef(false);
   const scaleRef = useRef(1);
+  const zoomRaf = useRef(0);
+  const zoomUp = useRef(true);
 
   useEffect(() => {
     const onResize = () => setGlow(pinGlowCssPx(window.devicePixelRatio));
@@ -107,12 +109,20 @@ export function Pin() {
       if (event.ctrlKey || event.metaKey) {
         setOpacity((value) => Math.min(PIN_MAX_OPACITY, Math.max(PIN_MIN_OPACITY, value + (event.deltaY < 0 ? PIN_OPACITY_STEP : -PIN_OPACITY_STEP))));
       } else if (isTauri()) {
-        scaleRef.current = nextScale(scaleRef.current, event.deltaY < 0);
-        void pinZoom(scaleRef.current);
+        zoomUp.current = event.deltaY < 0;
+        if (zoomRaf.current) return;
+        zoomRaf.current = requestAnimationFrame(() => {
+          zoomRaf.current = 0;
+          scaleRef.current = nextScale(scaleRef.current, zoomUp.current);
+          void pinZoom(scaleRef.current);
+        });
       }
     };
     node.addEventListener("wheel", onWheel, { passive: false });
-    return () => node.removeEventListener("wheel", onWheel);
+    return () => {
+      node.removeEventListener("wheel", onWheel);
+      if (zoomRaf.current) cancelAnimationFrame(zoomRaf.current);
+    };
   }, [painted]);
 
   useEffect(() => {
@@ -120,8 +130,11 @@ export function Pin() {
   }, [failed]);
 
   function onPointerDown(event: React.PointerEvent) {
-    if (event.button !== 0 || !painted) return;
-    if ((event.target as HTMLElement).closest("button, .pin-menu")) return;
+    if (!painted) return;
+    const onMenu = (event.target as HTMLElement).closest("button, .pin-menu");
+    if (menu && !onMenu) setMenu(false);
+    if (event.button !== 0) return;
+    if (onMenu) return;
     const stamp = { time: Date.now(), x: event.clientX, y: event.clientY };
     if (event.detail >= 2 || isDoubleClick(lastClickRef.current, stamp)) {
       lastClickRef.current = null;
@@ -144,14 +157,20 @@ export function Pin() {
       style={{ opacity, "--pin-glow": `${glow}px` } as CSSProperties}
       onPointerDown={onPointerDown}
       onDoubleClick={() => { if (painted) void closePin(); }}
-      onContextMenu={(event) => { event.preventDefault(); if (painted) setMenu(true); }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        if (!painted) return;
+        const onMenu = (event.target as HTMLElement).closest("button, .pin-menu");
+        if (onMenu) return;
+        setMenu((value) => !value);
+      }}
     >
       {failed ? failed : <div className="pin-glow" aria-hidden="true" />}
       <canvas ref={canvasRef} />
       {menu && (
         <div className="pin-menu">
-          <button onClick={() => void copyPin(idRef.current)}>{t("copy")}</button>
-          <button onClick={() => void closePin()}>{t("cancel")}</button>
+          <button onClick={() => { setMenu(false); void copyPin(idRef.current); }}>{t("copy")}</button>
+          <button onClick={() => { setMenu(false); void closePin(); }}>{t("cancel")}</button>
         </div>
       )}
     </div>

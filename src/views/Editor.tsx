@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { commitHistory, copyFile, copyPngBase64, currentEditor, loadImage, ocrPngBase64, pickSavePath, pinPngBase64, updateHistory, writePngBase64 } from "../api";
+import { commitHistoryRaw, copyFile, copyPngRaw, currentEditor, loadImage, ocrPng, pickSavePath, pinPngBase64, updateHistoryRaw, writePng } from "../api";
 import { Annotator } from "../editor/Annotator";
 import { rotateLayer, type Layer } from "../editor/model";
 import { useI18n } from "../i18n";
@@ -79,16 +79,18 @@ export function Editor() {
         fileBacked.current = false;
         cropImage(image, rect).then((next) => replaceImage(next, [])).catch(() => undefined);
       }}
-      onAction={async (action, png, base, layers) => {
+      onAction={async (action, png, base, layers, pngBytes, baseBytes) => {
         let ocrText = "";
-        if (action === "ocr") ocrText = await ocrPngBase64(png);
-        if (action === "copy") await copyPngBase64(png);
+        if (action === "ocr") ocrText = await ocrPng(pngBytes);
+        if (action === "copy") await copyPngRaw(png, pngBytes);
         const body = { pngBase64: png, basePngBase64: base, document: JSON.stringify(layers), ocrText, width: image.naturalWidth, height: image.naturalHeight, name: "" };
-        const item = recordId ? await updateHistory(recordId, body) : await commitHistory(body);
+        const item = recordId
+          ? await updateHistoryRaw(recordId, body, pngBytes, baseBytes)
+          : await commitHistoryRaw(body, pngBytes, baseBytes);
         if (!recordId) setRecordId(item.id);
         if (action === "save") {
           const dest = await pickSavePath(`${item.name}.png`);
-          if (dest) await writePngBase64(png, dest);
+          if (dest) await writePng(pngBytes, dest);
         }
         if (action === "pin") await pinPngBase64(png, 120, 120);
         return ocrText;

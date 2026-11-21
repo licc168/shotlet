@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Annotator } from "../editor/Annotator";
-import { aimOverlay, cancelCapture, commitHistory, copyAnnotated, copyCaptureRegion, copyPngBase64, currentCapture, isTauri, loadFrozen, ocrPngBase64, onEvent, openRecording, overlayReady, pinAnnotated, pinAnnotatedRgba, pinCaptureRegion, pinHistory, pickSavePath, scrollCapture, setOverlayFollow, writePngBase64, type ShotImage } from "../api";
+import { aimOverlay, cancelCapture, commitHistory, commitHistoryRaw, copyAnnotatedRaw, copyCaptureRegion, copyPngBase64, copyPngRaw, currentCapture, isTauri, loadFrozen, ocrPng, onEvent, openRecording, overlayReady, pinAnnotated, pinAnnotatedRgba, pinCaptureRegion, pinHistory, pickSavePath, scrollCapture, setOverlayFollow, writePng, type ShotImage } from "../api";
 import { screenCssSize } from "../editor/draw";
 import { useI18n } from "../i18n";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
@@ -232,13 +232,22 @@ export function Overlay() {
 
   function sampleHex(point: { x: number; y: number }) {
     if (!image) return "#000000";
+    const x = Math.min(image.naturalWidth - 1, Math.max(0, Math.round(point.x)));
+    const y = Math.min(image.naturalHeight - 1, Math.max(0, Math.round(point.y)));
+    // Binary captures carry the raw RGBA buffer: read the pixel directly instead
+    // of stalling the GPU with a per-frame 1x1 drawImage + getImageData.
+    if (image.pixels) {
+      const at = (y * image.naturalWidth + x) * 4;
+      const data = image.pixels;
+      return `#${[data[at], data[at + 1], data[at + 2]].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+    }
     const canvas = sampleRef.current ?? document.createElement("canvas");
     sampleRef.current = canvas;
     canvas.width = 1;
     canvas.height = 1;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return "#000000";
-    ctx.drawImage(image, Math.round(point.x), Math.round(point.y), 1, 1, 0, 0, 1, 1);
+    ctx.drawImage(image, x, y, 1, 1, 0, 0, 1, 1);
     const pixel = ctx.getImageData(0, 0, 1, 1).data;
     return `#${[pixel[0], pixel[1], pixel[2]].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
   }
@@ -522,14 +531,14 @@ export function Overlay() {
               setError(reason instanceof Error ? reason.message : String(reason));
             });
           }}
-          onAction={async (action, png, base, layers) => {
+          onAction={async (action, png, base, layers, pngBytes, baseBytes) => {
             if (action === "copy" && isTauri()) {
-              await copyAnnotated(png, base, JSON.stringify(layers));
+              await copyAnnotatedRaw(png, JSON.stringify(layers), pngBytes, baseBytes);
               await cancelCapture();
               return "";
             }
             let ocrText = "";
-            if (action === "ocr") ocrText = await ocrPngBase64(png);
+            if (action === "ocr") ocrText = await ocrPng(pngBytes);
             if (action === "pin") {
               await pinAnnotated(
                 png,
@@ -549,7 +558,7 @@ export function Overlay() {
               await cancelCapture();
               return "";
             }
-            const item = await commitHistory({
+            const item = await commitHistoryRaw({
               pngBase64: png,
               basePngBase64: base,
               document: JSON.stringify(layers),
@@ -557,11 +566,11 @@ export function Overlay() {
               width: Math.round(selection.w),
               height: Math.round(selection.h),
               name: "",
-            });
-            if (action === "copy") await copyPngBase64(png);
+            }, pngBytes, baseBytes);
+            if (action === "copy") await copyPngRaw(png, pngBytes);
             if (action === "save") {
               const dest = await pickSavePath(`${item.name}.png`);
-              if (dest) await writePngBase64(png, dest);
+              if (dest) await writePng(pngBytes, dest);
             }
             if (action !== "ocr") await cancelCapture();
             return ocrText;

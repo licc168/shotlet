@@ -1046,9 +1046,7 @@ impl PinWait {
     pub fn id(&self) -> &str {
         &self.id
     }
-}
 
-impl PinWait {
     pub fn wait(self) -> Result<(), String> {
         match self.rx.recv_timeout(PIN_REVEAL_WAIT) {
             Ok(result) => result,
@@ -1059,12 +1057,6 @@ impl PinWait {
                 Ok(())
             }
         }
-    }
-
-    pub async fn ready(self) -> Result<(), String> {
-        tauri::async_runtime::spawn_blocking(move || self.wait())
-            .await
-            .map_err(err)?
     }
 }
 

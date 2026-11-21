@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
@@ -40,7 +41,16 @@ pub async fn launch_mode(app: AppHandle, mode: &str) -> Result<(), String> {
     let mode_for_capture = mode.clone();
     let shot = tauri::async_runtime::spawn_blocking(move || capture_session::grab(&mode_for_capture, wait_for_hide))
         .await
-        .map_err(err)??;
+        .map_err(err)?;
+    let shot = match shot {
+        Ok(shot) => shot,
+        Err(error) => {
+            if error.contains("屏幕录制") {
+                prompt_screen_recording(&app);
+            }
+            return Err(error);
+        }
+    };
     if !capture_session::is_current(&app.state::<AppState>(), epoch) {
         return Ok(());
     }
@@ -118,6 +128,29 @@ pub fn aim_overlay(app: AppHandle, x: i32, y: i32) {
     ui::aim_overlay_at(&app, x, y);
 }
 
+fn prompt_screen_recording(app: &AppHandle) {
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        app.dialog()
+            .message("没有屏幕录制权限，所以选区不会出现。请到系统设置中允许 Shotlet。用开发模式运行时，列表里的名字是 shotlet；如果开关已经打开，先关掉再打开，然后重新启动应用。")
+            .title("Shotlet 截图")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCustom("打开系统设置".into()))
+            .show(move |ok| {
+                if ok {
+                    let _ = app.opener().open_url(
+                        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
+                        None::<&str>,
+                    );
+                }
+            });
+    });
+}
+
 pub(crate) fn spawn_launch(app: &AppHandle, mode: &'static str) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -180,16 +213,38 @@ fn storage(app: &AppHandle) -> Result<PathBuf, String> {
     library::ensure_dir(&data, &settings)
 }
 
+fn shortcut_log_sender() -> &'static std::sync::mpsc::Sender<(PathBuf, String)> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<(PathBuf, String)>> = std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, String)>();
+        std::thread::Builder::new()
+            .name("shotlet-shortcut-log".into())
+            .spawn(move || {
+                use std::io::Write;
+                while let Ok((dir, line)) = rx.recv() {
+                    eprint!("shortcuts: {line}");
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("shotlet.log"))
+                    {
+                        let _ = file.write_all(line.as_bytes());
+                    }
+                }
+            })
+            .expect("spawn shortcut log worker");
+        tx
+    })
+}
+
 pub(crate) fn shortcut_log(app: &AppHandle, message: &str) {
     let stamp = chrono::Local::now().format("%H:%M:%S");
     let line = format!("[{stamp}] {message}\n");
-    eprint!("shortcuts: {line}");
+    // The CGEventTap callback calls this on macOS. Keep it non-blocking: only
+    // format and hand off; the worker owns the synchronous filesystem write.
     if let Ok(dir) = ui::app_data_dir(app) {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("shotlet.log")) {
-            use std::io::Write;
-            let _ = file.write_all(line.as_bytes());
-        }
+        let _ = shortcut_log_sender().send((dir, line));
     }
 }
 
@@ -315,6 +370,12 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     let data = ui::app_data_dir(&app)?;
     library::save_settings(&data, &settings)?;
     shortcut::remember(&app.state::<AppState>(), settings.clone())?;
+    // Authorize after the in-memory settings are updated: `storage` reads them
+    // back, so granting the scope any earlier would whitelist the old directory
+    // and leave a newly chosen storage_dir unreadable over asset://.
+    if let Ok(root) = storage(&app) {
+        let _ = app.asset_protocol_scope().allow_directory(root, true);
+    }
     apply_shortcuts(&app, &settings)?;
     ui::rebuild_tray_menu(&app)?;
     let _ = app.emit("settings-changed", &settings);
@@ -332,6 +393,164 @@ fn validate_shortcut(text: &str) -> Result<(), String> {
 #[tauri::command]
 pub fn list_history(app: AppHandle, query: String, filter: String) -> Result<Vec<HistoryItem>, String> {
     library::list(&storage(&app)?, &query, &filter)
+}
+
+// ---- Binary commit protocol ------------------------------------------------
+// A raw IPC body can carry only one blob, so a commit is packed into one frame:
+//   [u32 LE png len][u32 LE base len][u32 LE meta len]
+//   [png bytes][base bytes][meta JSON: document / ocrText / width / height / name / id]
+// Both images and the annotation document stay out of JSON Base64.
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitMeta {
+    #[serde(default)]
+    document: String,
+    #[serde(default)]
+    ocr_text: String,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    id: String,
+}
+
+fn commit_frame(request: &tauri::ipc::Request<'_>) -> Result<(Vec<u8>, Vec<u8>, CommitMeta), String> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => parse_frame(bytes),
+        _ => Err("expected a raw commit frame".into()),
+    }
+}
+
+fn parse_frame(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, CommitMeta), String> {
+    const HEADER: usize = 12;
+    if bytes.len() < HEADER {
+        return Err("commit frame too short".into());
+    }
+    let png_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let base_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let meta_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let total = HEADER
+        .checked_add(png_len)
+        .and_then(|value| value.checked_add(base_len))
+        .and_then(|value| value.checked_add(meta_len))
+        .ok_or_else(|| "commit frame overflow".to_string())?;
+    if bytes.len() != total {
+        return Err("commit frame length mismatch".into());
+    }
+    let png_end = HEADER + png_len;
+    let base_end = png_end + base_len;
+    let png = bytes[HEADER..png_end].to_vec();
+    // Guard against a caller sending an empty comparison image: an empty
+    // `.base.png` would silently corrupt the history compare view.
+    let base = if base_len == 0 {
+        png.clone()
+    } else {
+        bytes[png_end..base_end].to_vec()
+    };
+    let meta: CommitMeta = serde_json::from_slice(&bytes[base_end..]).map_err(err)?;
+    Ok((png, base, meta))
+}
+
+#[cfg(test)]
+mod commit_frame_tests {
+    use super::parse_frame;
+
+    fn frame(png: &[u8], base: &[u8], meta: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + png.len() + base.len() + meta.len());
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(base.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        out.extend_from_slice(png);
+        out.extend_from_slice(base);
+        out.extend_from_slice(meta.as_bytes());
+        out
+    }
+
+    const META: &str = r#"{"document":"[]","ocrText":"hi","width":10,"height":20,"name":"n","id":"abc"}"#;
+
+    #[test]
+    fn parses_a_valid_frame() {
+        let (png, base, meta) = parse_frame(&frame(b"PNG-DATA", b"BASE-DATA", META)).unwrap();
+        assert_eq!(png, b"PNG-DATA");
+        assert_eq!(base, b"BASE-DATA");
+        assert_eq!(meta.id, "abc");
+        assert_eq!(meta.width, 10);
+        assert_eq!(meta.ocr_text, "hi");
+    }
+
+    #[test]
+    fn an_empty_base_falls_back_to_the_shot() {
+        let (png, base, _) = parse_frame(&frame(b"PNG-DATA", b"", META)).unwrap();
+        assert_eq!(png, b"PNG-DATA");
+        assert_eq!(base, png);
+    }
+
+    #[test]
+    fn rejects_short_and_mismatched_frames() {
+        assert!(parse_frame(&[0, 1, 2]).is_err());
+        let mut broken = frame(b"PNG-DATA", b"BASE-DATA", META);
+        broken.pop();
+        assert!(parse_frame(&broken).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_length_fields() {
+        let (png, base, _) = parse_frame(&frame(b"PNG-DATA", b"", META)).unwrap();
+        assert_eq!(png.len(), 8);
+        assert_eq!(base.len(), 8);
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        huge.extend_from_slice(&0u32.to_le_bytes());
+        assert!(parse_frame(&huge).is_err());
+    }
+}
+
+#[tauri::command]
+pub async fn commit_history_raw(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<HistoryItem, String> {
+    let (png, base, meta) = commit_frame(&request)?;
+    let root = storage(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        library::commit_raw(&root, &png, &base, &meta.document, meta.width, meta.height, &meta.name, &meta.ocr_text)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn update_history_raw(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<HistoryItem, String> {
+    let (png, base, meta) = commit_frame(&request)?;
+    if meta.id.trim().is_empty() {
+        return Err("missing history id".into());
+    }
+    let root = storage(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        library::update_document_raw(
+            &root, &meta.id, &png, &base, &meta.document, meta.width, meta.height, &meta.name, &meta.ocr_text,
+        )
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub fn copy_annotated_raw(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let (png, base, meta) = commit_frame(&request)?;
+    library::copy_annotated_bytes(&storage(&app)?, png, base, &meta.document)?;
+    let _ = app.emit("capture-error", "已复制截图");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn copy_png_raw(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => library::copy_png_bytes(bytes),
+        _ => Err("expected raw PNG bytes".into()),
+    }
 }
 
 #[tauri::command]
@@ -391,6 +610,31 @@ pub async fn write_png_base64(data: String, dest: String) -> Result<(), String> 
         .map_err(err)?
 }
 
+/// Save a PNG sent as a raw binary body. The destination path travels in the
+/// `x-write-dest` header as Base64(UTF-8) so non-ASCII paths survive the header.
+#[tauri::command]
+pub async fn write_png_raw(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.to_vec(),
+        _ => return Err("expected raw PNG bytes".into()),
+    };
+    let encoded = request
+        .headers()
+        .get("x-write-dest")
+        .ok_or_else(|| "missing x-write-dest".to_string())?
+        .to_str()
+        .map_err(err)?
+        .to_string();
+    let dest = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(err)?;
+    let dest = String::from_utf8(dest).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || library::write_png_bytes(&bytes, Path::new(&dest)))
+        .await
+        .map_err(err)?
+}
+
 #[tauri::command]
 pub fn copy_png_base64(data: String) -> Result<(), String> {
     library::copy_png_base64(&data)
@@ -423,6 +667,15 @@ pub async fn pin_file(app: AppHandle, path: String, x: f64, y: f64) -> Result<()
     Ok(())
 }
 
+/// Let the pin reveal itself without holding the caller's future open.
+/// `PinWait::wait` still runs in the background so its 3s reveal fallback
+/// (and the 8s one armed with the window) keep protecting a stalled webview.
+fn reveal_pin_in_background(wait: ui::PinWait) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = wait.wait();
+    });
+}
+
 #[tauri::command]
 pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Result<(), String> {
     library::trace("pin: command");
@@ -436,9 +689,8 @@ pub async fn pin_png_base64(app: AppHandle, data: String, x: f64, y: f64) -> Res
         .map_err(err)??;
     eprintln!("pin: wrote {} ({width}x{height})", path.display());
     library::trace("pin: file written");
-    ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?
-        .ready()
-        .await?;
+    let wait = ui::open_pin(&app, path.to_string_lossy().to_string(), x, y, width, height)?;
+    reveal_pin_in_background(wait);
     Ok(())
 }
 
@@ -467,9 +719,8 @@ pub async fn pin_capture_region(
         .map_err(err)??;
     library::trace("pin: plain cropped");
     let root = storage(&app)?;
-    ui::open_memory(&app, root, image, place_x, place_y, place_w, place_h)?
-        .ready()
-        .await?;
+    let wait = ui::open_memory(&app, root, image, place_x, place_y, place_w, place_h)?;
+    reveal_pin_in_background(wait);
     Ok(())
 }
 
@@ -615,7 +866,8 @@ pub async fn pin_clipboard_now(app: &AppHandle) -> Result<(), String> {
     let height = image.height();
     eprintln!("pin: clipboard memory at {x},{y} ({width}x{height})");
     let root = storage(app)?;
-    ui::open_memory(app, root, image, x, y, width, height)?.ready().await?;
+    let wait = ui::open_memory(app, root, image, x, y, width, height)?;
+    reveal_pin_in_background(wait);
     let _ = app.emit("capture-error", "已贴图");
     Ok(())
 }
@@ -679,6 +931,22 @@ pub fn preview_rgba(path: String) -> Result<tauri::ipc::Response, String> {
 #[tauri::command]
 pub async fn ocr_png_base64(data: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || library::recognize_png(&data)).await.map_err(err)?
+}
+
+/// OCR a PNG sent as a raw binary body.
+///
+/// OCR is CPU-bound and can take seconds, so it must not sit on the async
+/// runtime's workers: copy the body out of the request and hand it to the
+/// blocking pool, matching `ocr_png_base64`.
+#[tauri::command]
+pub async fn ocr_png_raw(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.to_vec(),
+        _ => return Err("expected raw PNG bytes".into()),
+    };
+    tauri::async_runtime::spawn_blocking(move || library::recognize_png_bytes(&bytes))
+        .await
+        .map_err(err)?
 }
 
 #[tauri::command]

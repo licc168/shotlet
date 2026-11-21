@@ -94,24 +94,36 @@ pub fn copy_png_file(path: &Path) -> Result<(), String> {
     util::copy_rgba(&image)
 }
 
-pub fn write_png_base64(data: &str, dest: &Path) -> Result<(), String> {
+fn write_png_bytes_inner(bytes: &[u8], dest: &Path) -> Result<(), String> {
     if !dest.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
         return Err("只能保存为 PNG".into());
     }
-    let bytes = util::decode_png(data)?;
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        util::write_bytes(dest, &bytes)
+        util::write_bytes(dest, bytes)
     } else {
-        let image = util::load_rgba(&bytes)?;
+        let image = util::load_rgba(bytes)?;
         util::write_png(dest, &image)
     }
 }
 
+pub fn write_png_bytes(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    write_png_bytes_inner(bytes, dest)
+}
+
+pub fn write_png_base64(data: &str, dest: &Path) -> Result<(), String> {
+    let bytes = util::decode_png(data)?;
+    write_png_bytes_inner(&bytes, dest)
+}
+
 pub fn copy_png_base64(data: &str) -> Result<(), String> {
     let bytes = util::decode_png(data)?;
-    let image = util::load_rgba(&bytes)?;
+    copy_png_bytes(&bytes)
+}
+
+pub fn copy_png_bytes(bytes: &[u8]) -> Result<(), String> {
+    let image = util::load_rgba(bytes)?;
     if bytes.starts_with(b"\x89PNG") {
-        util::copy_prepared(&bytes, &image)
+        util::copy_prepared(bytes, &image)
     } else {
         util::copy_rgba(&image)
     }
@@ -119,6 +131,13 @@ pub fn copy_png_base64(data: &str) -> Result<(), String> {
 
 pub fn copy_annotated(root: &Path, png_b64: &str, base_b64: &str, document: &str) -> Result<(), String> {
     let png = util::decode_png(png_b64)?;
+    let base = util::decode_png(base_b64).unwrap_or_default();
+    copy_annotated_bytes(root, png, base, document)
+}
+
+/// Copy an annotated shot from raw PNG bytes. Clipboard work stays on the
+/// caller; the history write keeps its original background thread.
+pub fn copy_annotated_bytes(root: &Path, png: Vec<u8>, base: Vec<u8>, document: &str) -> Result<(), String> {
     let image = util::load_rgba(&png)?;
     if png.starts_with(b"\x89PNG") {
         util::copy_prepared(&png, &image)?;
@@ -126,18 +145,46 @@ pub fn copy_annotated(root: &Path, png_b64: &str, base_b64: &str, document: &str
         util::copy_rgba(&image)?;
     }
     let root = root.to_path_buf();
-    let base_b64 = base_b64.to_string();
     let document = document.to_string();
     let width = image.width();
     let height = image.height();
     std::thread::spawn(move || {
-        let base = util::decode_png(&base_b64).unwrap_or_else(|_| png.clone());
         let base = if base.starts_with(b"\x89PNG") { base } else { png.clone() };
         if let Err(error) = history::commit_bytes(&root, &png, &base, &document, width, height, "", "") {
             eprintln!("history: {error}");
         }
     });
     Ok(())
+}
+
+/// Commit straight from raw PNG bytes, skipping a Base64 decode on both images.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_raw(
+    root: &Path,
+    png: &[u8],
+    base: &[u8],
+    document: &str,
+    width: u32,
+    height: u32,
+    name: &str,
+    ocr_text: &str,
+) -> Result<HistoryItem, String> {
+    history::commit_bytes(root, png, base, document, width, height, name, ocr_text)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_document_raw(
+    root: &Path,
+    id: &str,
+    png: &[u8],
+    base: &[u8],
+    document: &str,
+    width: u32,
+    height: u32,
+    name: &str,
+    ocr_text: &str,
+) -> Result<HistoryItem, String> {
+    history::update_document_bytes(root, id, png, base, document, width, height, name, ocr_text)
 }
 
 pub fn copy_capture_region(state: &AppState, root: &Path, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
@@ -349,6 +396,14 @@ pub fn pin_path(state: &AppState, id: &str) -> Result<String, String> {
 
 pub fn recognize_png(data: &str) -> Result<String, String> {
     let text = ocr::recognize_png_base64(data)?;
+    if !text.is_empty() {
+        let _ = util::copy_text(&text);
+    }
+    Ok(text)
+}
+
+pub fn recognize_png_bytes(bytes: &[u8]) -> Result<String, String> {
+    let text = ocr::recognize_png_bytes(bytes)?;
     if !text.is_empty() {
         let _ = util::copy_text(&text);
     }

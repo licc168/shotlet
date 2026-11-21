@@ -206,6 +206,31 @@ pub fn update_document(root: &Path, id: &str, request: CommitRequest) -> Result<
     with_write(root, |records| update_locked(records, id, &request, &png, &base))
 }
 
+/// Same update without a Base64 round trip. Used by the binary IPC command.
+#[allow(clippy::too_many_arguments)]
+pub fn update_document_bytes(
+    root: &Path,
+    id: &str,
+    png: &[u8],
+    base: &[u8],
+    document: &str,
+    width: u32,
+    height: u32,
+    name: &str,
+    ocr_text: &str,
+) -> Result<HistoryItem, String> {
+    let request = CommitRequest {
+        png_base64: String::new(),
+        base_png_base64: String::new(),
+        document: document.to_string(),
+        ocr_text: ocr_text.to_string(),
+        width,
+        height,
+        name: name.to_string(),
+    };
+    with_write(root, |records| update_locked(records, id, &request, png, base))
+}
+
 fn update_locked(records: &mut Vec<Record>, id: &str, request: &CommitRequest, png: &[u8], base: &[u8]) -> Result<HistoryItem, String> {
     let Some(record) = records.iter_mut().find(|record| record.id == id) else {
         return Err("找不到这条历史记录".into());

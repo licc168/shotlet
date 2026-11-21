@@ -41,7 +41,9 @@ pub fn run() {
             commands::save_settings,
             commands::list_history,
             commands::commit_history,
+            commands::commit_history_raw,
             commands::update_history,
+            commands::update_history_raw,
             commands::set_favorite,
             commands::set_tags,
             commands::rename_capture,
@@ -51,8 +53,11 @@ pub fn run() {
             commands::export_captures,
             commands::copy_file,
             commands::write_png_base64,
+            commands::write_png_raw,
             commands::copy_png_base64,
+            commands::copy_png_raw,
             commands::copy_annotated,
+            commands::copy_annotated_raw,
             commands::pin_file,
             commands::pin_png_base64,
             commands::pin_capture_region,
@@ -67,6 +72,7 @@ pub fn run() {
             commands::read_image_bytes,
             commands::preview_rgba,
             commands::ocr_png_base64,
+            commands::ocr_png_raw,
             commands::open_editor_record,
             commands::current_editor,
             commands::scroll_capture,
@@ -89,6 +95,12 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&data);
             shotlet_core::library::set_trace_file(data.join("shotlet.log"));
             let preferences = settings::load(&data);
+            if let Err(error) = app
+                .asset_protocol_scope()
+                .allow_directory(settings::storage_root(&data, &preferences), true)
+            {
+                eprintln!("asset scope: {error}");
+            }
             app.manage(AppState::new(preferences.clone()));
             if let Err(error) = ui::install_tray(app.handle()) {
                 eprintln!("tray: {error}");

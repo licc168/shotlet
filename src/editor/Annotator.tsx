@@ -19,7 +19,14 @@ type Props = {
   initialDocument?: string;
   desktop?: boolean;
   onClose: () => void;
-  onAction: (action: Action, png: string, base: string, layers: Layer[]) => Promise<string | void>;
+  onAction: (
+    action: Action,
+    png: string,
+    base: string,
+    layers: Layer[],
+    pngBytes: Uint8Array<ArrayBuffer>,
+    baseBytes: Uint8Array<ArrayBuffer>,
+  ) => Promise<string | void>;
   onPlainCopy?: (selection: Rect) => Promise<boolean>;
   onPlainPin?: (selection: Rect) => Promise<boolean>;
   onAnnotatedPin?: (pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, selection: Rect, layers: Layer[]) => Promise<boolean>;
@@ -33,6 +40,11 @@ const TOOLS: Tool[] = ["rect", "ellipse", "arrow", "brush", "mosaic", "highlight
 const CAPTURE_DOUBLE_CLICK_MS = 500;
 const CAPTURE_DOUBLE_CLICK_DIST = 48;
 const NEW_SELECTION_SLOP = 6;
+
+// WebView2 drops a canvas update made after paint until the next mouse move.
+// Reading one pixel forces the frame through. Other WebViews do not need it,
+// and the read stalls the GPU pipeline on every drag frame.
+const needsCanvasFlush = typeof navigator !== "undefined" && /Edg\//i.test(navigator.userAgent);
 
 export function Annotator(props: Props) {
   const { t } = useI18n();
@@ -55,6 +67,7 @@ export function Annotator(props: Props) {
   const [redo, setRedo] = useState<Layer[][]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [draft, setDraft] = useState<Layer | null>(null);
+  const draftRef = useRef<Layer | null>(null);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const [numbers, setNumbers] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -74,14 +87,23 @@ export function Annotator(props: Props) {
   const fontAtDown = useRef<number | null>(null);
   const watermarkAtFocus = useRef<string | null>(null);
   const lastPointerDown = useRef<{ time: number; x: number; y: number } | null>(null);
+  type MoveSnapshot = { clientX: number; clientY: number; buttons: number; shiftKey: boolean };
+  const pendingMove = useRef<MoveSnapshot | null>(null);
+  const moveRaf = useRef(0);
   const framedSelection = useRef(props.selection);
   if (props.selection.w >= 4 && props.selection.h >= 4) framedSelection.current = props.selection;
   layersRef.current = layers;
+  draftRef.current = draft;
   selectedRef.current = selected;
   fontSizeRef.current = fontSize;
   colorRef.current = color;
   textDraftRef.current = textDraft;
   const editingId = textDraft?.id;
+
+  function commitDraft(next: Layer | null) {
+    draftRef.current = next;
+    setDraft(next);
+  }
 
   const shown = useMemo(() => {
     const visible = editingId ? layers.filter((layer) => layer.id !== editingId) : layers;
@@ -116,9 +138,7 @@ export function Annotator(props: Props) {
     const viewScale = previewScale(props.selection.w, props.selection.h, rect.width, rect.height, window.devicePixelRatio);
     try {
       renderScene(ctx, props.image, props.selection, shown, viewScale, false);
-      // WebView2 drops a canvas update that happens after paint, until the next
-      // mouse move. Drawing before paint, then reading a pixel, keeps this frame.
-      ctx.getImageData(0, 0, 1, 1);
+      if (needsCanvasFlush) ctx.getImageData(0, 0, 1, 1);
     } catch (error) {
       console.error(error);
     }
@@ -372,15 +392,15 @@ export function Annotator(props: Props) {
       return;
     }
     const id = uid();
-    const created = createDraft(id, tool, point, color, thickness, filled, block, radius, ellipseHighlight);
+      const created = createDraft(id, tool, point, color, thickness, filled, block, radius, ellipseHighlight);
     if (created) {
-      setDraft(created);
+      commitDraft(created);
       drag.current = { kind: "draw", id, start: point, last: point, origin: created, box: null };
       capturePointer(event);
     }
   }
 
-  function onPointerMove(event: React.PointerEvent) {
+  function applyMove(event: MoveSnapshot) {
     const current = drag.current;
     if (!current || (event.buttons & 1) === 0) {
       if (!current && props.editableSelection && stageRef.current) {
@@ -402,11 +422,11 @@ export function Annotator(props: Props) {
         const next = appendStrokePoint(current.origin, point);
         if (next !== current.origin) {
           current.origin = next;
-          setDraft(next);
+          commitDraft(next);
         }
         return;
       }
-      setDraft(updateDraft(current.origin, current.start, point, event.shiftKey));
+      commitDraft(updateDraft(current.origin, current.start, point, event.shiftKey));
       return;
     }
     if (current.kind === "move" && current.origin) {
@@ -464,7 +484,36 @@ export function Annotator(props: Props) {
     }
   }
 
+  function flushMove() {
+    if (moveRaf.current) {
+      cancelAnimationFrame(moveRaf.current);
+      moveRaf.current = 0;
+    }
+    const snapshot = pendingMove.current;
+    pendingMove.current = null;
+    if (snapshot) applyMove(snapshot);
+  }
+
+  // High-frequency pointers fire far more often than the display refreshes.
+  // Coalesce to one update per frame: keep only the newest snapshot and let the
+  // layout effect render once, instead of a full re-render per event.
+  function onPointerMove(event: React.PointerEvent) {
+    pendingMove.current = { clientX: event.clientX, clientY: event.clientY, buttons: event.buttons, shiftKey: event.shiftKey };
+    if (moveRaf.current) return;
+    moveRaf.current = requestAnimationFrame(() => {
+      moveRaf.current = 0;
+      const snapshot = pendingMove.current;
+      pendingMove.current = null;
+      if (snapshot) applyMove(snapshot);
+    });
+  }
+
+  useEffect(() => () => {
+    if (moveRaf.current) cancelAnimationFrame(moveRaf.current);
+  }, []);
+
   function onPointerUp(event: React.PointerEvent) {
+    flushMove();
     const current = drag.current;
     drag.current = null;
     if (stageRef.current) stageRef.current.style.cursor = "";
@@ -472,7 +521,7 @@ export function Annotator(props: Props) {
       props.onSelectionChange(current.box);
     }
     if (current?.kind === "draw") {
-      let finished = draft;
+      let finished = draftRef.current;
       if (current.origin && (current.origin.type === "brush" || current.origin.type === "mosaic")) {
         const point = toImage(event);
         finished = isDragGlitch(point, current.last, { w: props.image.naturalWidth, h: props.image.naturalHeight })
@@ -490,7 +539,7 @@ export function Annotator(props: Props) {
             setEllipseHighlight(finished.ellipse);
           }
         }
-        setDraft(null);
+        commitDraft(null);
       }
     }
     if (current?.kind === "move" && current.origin?.type === "text") {
@@ -625,12 +674,19 @@ export function Annotator(props: Props) {
           // Binary bodies are not available everywhere. The base64 path below still pins.
         }
       }
-      const baseTask = action === "pin" ? Promise.resolve("") : renderPng(props.image, selection, [], false);
+      const plain = marks.length === 0;
+      const needsBase = action !== "pin" && !plain;
+      const baseTask = needsBase ? renderPng(props.image, selection, [], false) : null;
       if (action === "pin") tracePage("pin: render begin");
-      const png = await renderPng(props.image, selection, marks, true);
+      const rendered = await renderPng(props.image, selection, marks, true);
       if (action === "pin") tracePage("pin: render done");
-      const base = await baseTask;
-      const text = await props.onAction(action, png, base, marks);
+      // `pin` keeps an empty Base64 base for the legacy path, but the binary
+      // frame still needs a real comparison image, so it uses the shot itself.
+      // Otherwise reuse the same render when plain, or the un-annotated one.
+      const baseResult = action === "pin"
+        ? { base64: "", bytes: rendered.bytes }
+        : (baseTask ? await baseTask : rendered);
+      const text = await props.onAction(action, rendered.base64, baseResult.base64, marks, rendered.bytes, baseResult.bytes);
       if (action === "ocr") {
         const value = typeof text === "string" ? text.trim() : "";
         setOcrText(value);
@@ -653,44 +709,46 @@ export function Annotator(props: Props) {
     }
   }
 
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      const target = event.target as HTMLElement | null;
-      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) return;
-      if (event.key === "Escape") props.onClose();
-      if (event.key === "Enter") void run("copy");
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        if (event.shiftKey) {
-          setRedo((stack) => {
-            const previous = stack[stack.length - 1];
-            if (!previous) return stack;
-            setUndo((items) => [...items, layers]);
-            restoreLayers(previous);
-            return stack.slice(0, -1);
-          });
-        } else {
-          setUndo((stack) => {
-            const previous = stack[stack.length - 1];
-            if (!previous) return stack;
-            setRedo((items) => [...items, layers]);
-            restoreLayers(previous);
-            return stack.slice(0, -1);
-          });
-        }
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        void run("save");
-      }
-      if (event.key === "Delete" || event.key === "Backspace") {
-        if (selected) push(layers.filter((layer) => layer.id !== selected));
-        choose(null);
+  const onKeyRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  onKeyRef.current = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement | null;
+    if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) return;
+    if (event.key === "Escape") props.onClose();
+    if (event.key === "Enter") void run("copy");
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      if (event.shiftKey) {
+        setRedo((stack) => {
+          const previous = stack[stack.length - 1];
+          if (!previous) return stack;
+          setUndo((items) => [...items, layers]);
+          restoreLayers(previous);
+          return stack.slice(0, -1);
+        });
+      } else {
+        setUndo((stack) => {
+          const previous = stack[stack.length - 1];
+          if (!previous) return stack;
+          setRedo((items) => [...items, layers]);
+          restoreLayers(previous);
+          return stack.slice(0, -1);
+        });
       }
     }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  });
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      void run("save");
+    }
+    if (event.key === "Delete" || event.key === "Backspace") {
+      if (selected) push(layers.filter((layer) => layer.id !== selected));
+      choose(null);
+    }
+  };
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => onKeyRef.current(event);
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   const stageStyle = props.desktop
     ? { position: "absolute" as const, inset: 0, width: "100%", height: "100%" }

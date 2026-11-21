@@ -1,19 +1,18 @@
 {
   "name": "shotlet",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node --test src/lib/selection.test.ts src/lib/stroke.test.ts src/lib/pin.test.ts src/editor/model.test.ts src/editor/draw.test.ts scripts/architecture.test.mjs scripts/app-version.test.mjs scripts/trace-summary.test.mjs",
+    "test": "node --experimental-strip-types --test src/lib/selection.test.ts src/lib/stroke.test.ts src/lib/pin.test.ts src/editor/model.test.ts src/editor/draw.test.ts scripts/architecture.test.mjs scripts/app-version.test.mjs scripts/trace-summary.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.8.4",
-    "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

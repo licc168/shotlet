@@ -16,7 +16,7 @@ Windows 和 macOS 上的截图、标注、贴图工具，用 Tauri 2、Rust 和 
 
 ## 开发
 
-需要 Node.js 18+、Rust 1.77+，以及 Windows 上的 WebView2。模块边界见 [crates/ARCHITECTURE.md](crates/ARCHITECTURE.md)。
+需要 Node.js 22+（测试用 `--experimental-strip-types` 直接跑 TypeScript）、Rust 1.77+，以及 Windows 上的 WebView2。模块边界见 [crates/ARCHITECTURE.md](crates/ARCHITECTURE.md)。
 
 ```bash
 npm install

@@ -6,6 +6,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+// Per-place overlay diagnostics walk every on-screen window (kCGWindowListOptionAll)
+// and fflush stderr. That runs on the capture hot path after each placement; keep it
+// behind a compile-time flag so normal builds never pay for it. Set to 1 to debug.
+#ifndef SHOTLET_OVERLAY_TRACE
+#define SHOTLET_OVERLAY_TRACE 0
+#endif
+
 // macOS 26 aborts in NSDP_getComputedPropertyValue if an NSWindow's isa is
 // swapped, and aborts again if orderOut: is added to the live KVO class.
 // Keep TaoWindow's class. Only constrainFrameRect:toScreen: is overridden.
@@ -598,6 +605,7 @@ static void shotlet_show_on_display(NSWindow *window, NSRect frame, int make_key
     shotlet_publish(window, frame, make_key);
 }
 
+static void shotlet_log(NSWindow *window, const char *phase) __attribute__((unused));
 static void shotlet_log(NSWindow *window, const char *phase) {
     NSString *frame = NSStringFromRect(window.frame);
     NSString *screen = window.screen.localizedName;
@@ -702,7 +710,9 @@ int shotlet_place_overlay(void *raw, double cg_x, double cg_y, double width, dou
                     NSStringFromRect(window.frame).UTF8String);
             fflush(stderr);
         }
+#if SHOTLET_OVERLAY_TRACE
         shotlet_log(window, "place");
+#endif
     };
     if ([NSThread isMainThread]) {
         place();

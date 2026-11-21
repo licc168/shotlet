@@ -131,13 +131,19 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   const [themeTick, setThemeTick] = useState(0);
 
   useEffect(() => {
+    let cancel = false;
     let stop: (() => void) | undefined;
-    getSettings().then(setSettings).catch(() => setSettings(defaultSettings));
-    onEvent<Settings>("settings-changed", setSettings).then((unlisten) => { stop = unlisten; }).catch(() => undefined);
+    getSettings()
+      .then((next) => { if (!cancel) setSettings(next); })
+      .catch(() => { if (!cancel) setSettings(defaultSettings); });
+    onEvent<Settings>("settings-changed", (next) => { if (!cancel) setSettings(next); })
+      .then((unlisten) => { if (cancel) unlisten(); else stop = unlisten; })
+      .catch(() => undefined);
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const onChange = () => setThemeTick((value) => value + 1);
     media.addEventListener("change", onChange);
     return () => {
+      cancel = true;
       stop?.();
       media.removeEventListener("change", onChange);
     };

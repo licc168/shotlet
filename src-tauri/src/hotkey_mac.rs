@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_ulong;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -76,6 +76,44 @@ static STATE: LazyLock<Mutex<MacState>> = LazyLock::new(|| Mutex::new(MacState {
     next_id: 1,
     attempt: 0,
 }));
+
+/// Immutable snapshot consumed by the CGEventTap / Carbon callbacks. Callbacks
+/// take the Arc and release the lock immediately, so a slow `apply_now` holding
+/// STATE never blocks the system input callback (which macOS may time out and
+/// disable the tap entirely). Replaced atomically whenever the tap is applied.
+struct TapSnapshot {
+    bindings: Vec<Binding>,
+    carbon: HashMap<u32, Shortcut>,
+    app: Option<AppHandle>,
+    tap_active: bool,
+    tap_wanted: bool,
+    tap_port: usize,
+}
+
+static TAP: LazyLock<RwLock<Arc<TapSnapshot>>> = LazyLock::new(|| {
+    RwLock::new(Arc::new(TapSnapshot {
+        bindings: Vec::new(),
+        carbon: HashMap::new(),
+        app: None,
+        tap_active: false,
+        tap_wanted: false,
+        tap_port: 0,
+    }))
+});
+
+fn publish_tap(state: &MacState) {
+    let snapshot = TapSnapshot {
+        bindings: state.tap_bindings.clone(),
+        carbon: state.bindings.iter().map(|(id, binding)| (*id, binding.shortcut)).collect(),
+        app: state.app.clone(),
+        tap_active: state.tap_active,
+        tap_wanted: state.tap_wanted,
+        tap_port: state.tap_port,
+    };
+    if let Ok(mut tap) = TAP.write() {
+        *tap = Arc::new(snapshot);
+    }
+}
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
@@ -211,6 +249,7 @@ fn apply_now(app: AppHandle, fresh: bool) {
     if tap_ok {
         // One real key must not reach both the tap and Carbon.
         state.attempt = 0;
+        publish_tap(&state);
         return;
     }
 
@@ -255,6 +294,7 @@ fn apply_now(app: AppHandle, fresh: bool) {
             "event tap unavailable, accessibility={trusted}; carbon fallback, {registered} hotkeys"
         ),
     );
+    publish_tap(&state);
     drop(state);
     if !trusted {
         prompt_accessibility(&app);
@@ -269,11 +309,13 @@ fn apply_now(app: AppHandle, fresh: bool) {
         } else {
             commands::shortcut_log(&app, "stopped retrying event tap");
         }
+        publish_tap(&state);
         return;
     }
     state.attempt += 1;
     let wait = RETRY_DELAYS_MS[state.attempt as usize - 1];
     commands::shortcut_log(&app, &format!("retry shortcuts in {wait}ms (attempt {})", state.attempt));
+    publish_tap(&state);
     drop(state);
     let app = app.clone();
     std::thread::spawn(move || {
@@ -418,11 +460,10 @@ unsafe extern "C" fn carbon_handler(
         return 0;
     }
     let found = {
-        let state = STATE.lock().expect("shortcut state");
-        state
-            .bindings
-            .get(&id)
-            .map(|binding| (state.app.clone(), binding.shortcut))
+        let Ok(tap) = TAP.read() else {
+            return EVENT_NOT_HANDLED;
+        };
+        tap.carbon.get(&id).map(|shortcut| (tap.app.clone(), shortcut.clone()))
     };
     if let Some((Some(app), shortcut)) = found {
         commands::shortcut_log(&app, &format!("carbon pressed {shortcut}"));
@@ -439,9 +480,9 @@ unsafe extern "C" fn tap_callback(
     _user: *mut c_void,
 ) -> *mut c_void {
     if event_type == TAP_DISABLED_TIMEOUT || event_type == TAP_DISABLED_USER {
-        if let Ok(state) = STATE.lock() {
-            if state.tap_wanted && state.tap_port != 0 {
-                unsafe { CGEventTapEnable(state.tap_port as *mut c_void, true); }
+        if let Ok(tap) = TAP.read() {
+            if tap.tap_wanted && tap.tap_port != 0 {
+                unsafe { CGEventTapEnable(tap.tap_port as *mut c_void, true); }
             }
         }
         return event;
@@ -456,14 +497,13 @@ unsafe extern "C" fn tap_callback(
     let keycode = unsafe { CGEventGetIntegerValueField(event, 9) } as u32;
     let mods = cg_flags_to_carbon_mods(unsafe { CGEventGetFlags(event) });
     let found = {
-        let Ok(state) = STATE.lock() else {
+        let Ok(tap) = TAP.read() else {
             return event;
         };
-        state
-            .tap_bindings
+        tap.bindings
             .iter()
             .find(|binding| binding.keycode == keycode && binding.carbon_mods == mods)
-            .map(|binding| (state.app.clone(), binding.shortcut, state.tap_active))
+            .map(|binding| (tap.app.clone(), binding.shortcut, tap.tap_active))
     };
     if let Some((Some(app), shortcut, swallow)) = found {
         commands::shortcut_log(&app, &format!("tap pressed {shortcut}"));
