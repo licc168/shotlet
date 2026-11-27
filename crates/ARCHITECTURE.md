@@ -64,6 +64,36 @@ DBX 发布配置用 `opt-level = "s"` 换体积。Shotlet 的发布配置保持 
 
 这里没有 CLI、MCP，也没有效果解释器。React 界面不因为 crate 拆分而改交互。
 
+## 平台
+
+Windows 和 macOS 的差异照 DBX：不按操作系统拆 crate，也不把同一条业务分成 `src/windows` 和 `src/macos`。包仍然按职责切。系统差异只换实现文件，调用方始终用同一个模块名。
+
+做法：
+
+1. 同一模块名。Windows 编真正的实现，其他平台用 `#[path]` 编另一份文件。调用处不写 `cfg`，也不在一个函数里分出两套流程。
+2. 另一份文件是完整实现或空实现。macOS 已有自己的行为时，保留那份行为，不要在 Windows 改动里改掉它。没有对应能力时，空实现什么都不做。
+3. 只有几行、而且两边语义相同的差别，可以留在函数内部的 `cfg`。例如托盘图标、读 Esc。一整段流程、Win32 或 WebView2 调用，不留在共享文件里。
+4. 依赖写在 `Cargo.toml` 的 `[target.'cfg(...)'.dependencies]`。macOS 不链 `webview2-com` 和 `windows`。Windows 不链 macOS 的 Objective-C。
+5. 安装包资源可以按目录放，例如 NSIS 或 `Info.plist`。那是打包材料，不是业务代码。
+
+```rust
+#[cfg(windows)]
+mod preview_buffer;
+#[cfg(not(windows))]
+#[path = "preview_buffer_noop.rs"]
+mod preview_buffer;
+```
+
+现在已经这样拆开的：
+
+| 模块名 | Windows | 其他平台 | 调用方 |
+| --- | --- | --- | --- |
+| `preview_buffer` | `src-tauri/src/preview_buffer.rs`，共享内存把冻结帧交给页面 | `preview_buffer_noop.rs`，什么都不做，页面仍走 `preview_rgba` | `ui.rs` 只调用 `preview_buffer::post` |
+| `drive` | `crates/shotlet-media/src/scroll_watch.rs`。默认拖滚动条拼接。Windows 和 macOS 用同一份 | 同上 | `scroll::capture_manual` 只调用 `drive::run` |
+| `wheel` | `scroll_wheel.rs`，发一次滚轮 | `scroll_wheel_noop.rs`，不发 | 只有用户打开「自动滚动」时，`drive::run` 才调用 `wheel::nudge` |
+
+新增一种只有一个系统才有的能力时，按上表加一对文件。不要在 `ui.rs`、`commands.rs` 或 `scroll.rs` 里再写一段 `#[cfg(windows)] { ... } #[cfg(not(windows))] { ... }` 的流程。
+
 ## 改代码时
 
 - 新的用户动作放进已有的 core 过程，或在 core 里加一个过程。
@@ -71,3 +101,4 @@ DBX 发布配置用 `opt-level = "s"` 换体积。Shotlet 的发布配置保持 
 - 壳层只增加窗口摆放和 IPC 转发。
 - 不在下层 crate 里加应用代次、全局会话或“当前是不是这一次按键”。
 - 不把同一条流程拆成壳层里的第二套状态机。
+- 只在一个系统上成立的流程，按「平台」一节换成同名模块的另一份文件。改 Windows 时不要改 macOS 那份文件的行为。

@@ -22,6 +22,10 @@ const OVERLAY: &str = "overlay";
 /// The overlay window is up. The page only hears Esc after that webview has keyboard
 /// focus, which a borderless show often does not get.
 static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
+/// The user closed the home window. A capture must not show it again.
+static HOME_DISMISSED: AtomicBool = AtomicBool::new(false);
+/// The app that was in front before the overlay took focus.
+static PRIOR_FOREGROUND: Mutex<isize> = Mutex::new(0);
 static OVERLAY_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 /// Open flag and the follower's park. The flag is written while the mutex is held
 /// so a close cannot be missed between the check and the wait.
@@ -129,29 +133,30 @@ fn park_overlay(window: &WebviewWindow) {
 }
 
 fn unveil_overlay(window: &WebviewWindow, focus: bool) {
-    let _ = window.set_ignore_cursor_events(false);
-    uncloak_pin(window);
-    set_revealed(window.label(), true);
-    if focus {
-        let _ = window.set_focus();
+    let app = window.app_handle().clone();
+    let label = window.label().to_string();
+    let app_for_task = app.clone();
+    let task = move || {
+        let Some(window) = app_for_task.get_webview_window(&label) else {
+            return;
+        };
+        // park() shows the HWND with a raw ShowWindow, so Tao's VISIBLE flag stays
+        // false. The next style change, including clearing click-through, calls
+        // ShowWindow(SW_HIDE) for any window Tao does not consider visible.
+        // show() first, on this thread, so the flag is set before that change.
+        let _ = window.show();
+        let _ = window.set_ignore_cursor_events(false);
+        uncloak_pin(&window);
+        set_revealed(&label, true);
+        if focus {
+            let _ = window.set_focus();
+        }
+    };
+    if on_main_thread() {
+        task();
+        return;
     }
-}
-
-fn arm_overlay_reveal(app: &AppHandle, label: String, generation: u64) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = on_main(&app, move |app| {
-            let Some(window) = app.get_webview_window(&label) else {
-                return;
-            };
-            let current = window.state::<AppState>().overlay_generation.load(Ordering::Relaxed);
-            if current != generation {
-                return;
-            }
-            let _ = reveal_overlay(&window, generation);
-        });
-    });
+    let _ = app.run_on_main_thread(task);
 }
 
 #[cfg(windows)]
@@ -251,6 +256,7 @@ pub fn open_settings(app: &AppHandle) {
 }
 
 pub fn open_home(app: &AppHandle) {
+    HOME_DISMISSED.store(false, Ordering::Relaxed);
     let app = app.clone();
     let _ = on_main(&app, move |app| {
         if let Some(window) = app.get_webview_window("main") {
@@ -259,6 +265,16 @@ pub fn open_home(app: &AppHandle) {
             let _ = window.set_focus();
         }
     });
+}
+
+pub fn note_home_dismissed() {
+    HOME_DISMISSED.store(true, Ordering::Relaxed);
+}
+
+pub fn hide_home_if_dismissed(window: &tauri::Window) {
+    if HOME_DISMISSED.load(Ordering::Relaxed) {
+        let _ = window.hide();
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -399,6 +415,7 @@ pub fn conceal_overlays(app: &AppHandle) -> bool {
 }
 
 pub fn present_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64) -> Result<(), String> {
+    remember_foreground();
     let places = places_for(frozen, generation);
     let slots = places.len().max(1);
     for slot in 0..slots {
@@ -421,14 +438,16 @@ pub fn present_overlays(app: &AppHandle, frozen: &FrozenCapture, generation: u64
             let (width, height) = point_box(place);
             if let Some(window) = app.get_webview_window(&place.label) {
                 place_if_moved(&window, place.x, place.y, width, height);
-                park_overlay(&window);
+                // Uncloak before the page asks for pixels. A cloaked WebView is
+                // occluded, so the reply sits for about a second.
+                unveil_overlay(&window, armed);
             }
-            arm_overlay_reveal(app, place.label.clone(), generation);
         } else {
             // Show before the page paints. A hidden WebView throttles the page, so the
             // frozen pixels would sit for about a second after F1.
             let _ = show_overlay_place(app, place, armed);
         }
+        hand_pixels(app, &place.label, frozen, slot, generation);
         app.emit_to(&place.label, "overlay-show", overlay_show_payload(frozen, slot, armed, generation))
             .map_err(err)?;
     }
@@ -458,17 +477,31 @@ pub fn present_more_overlays(app: &AppHandle, frozen: &FrozenCapture, generation
             let (width, height) = point_box(place);
             if let Some(window) = app.get_webview_window(&place.label) {
                 place_if_moved(&window, place.x, place.y, width, height);
-                park_overlay(&window);
+                unveil_overlay(&window, armed);
             }
-            arm_overlay_reveal(app, place.label.clone(), generation);
         } else {
             let _ = show_overlay_place(app, place, armed);
         }
+        hand_pixels(app, &place.label, frozen, slot, generation);
         app.emit_to(&place.label, "overlay-show", overlay_show_payload(frozen, slot, armed, generation))
             .map_err(err)?;
     }
     note_overlay_hwnds(app);
     Ok(())
+}
+
+/// The page paints from this copy. Outside Windows the module is a no-op and
+/// the page keeps reading pixels through `preview_rgba`.
+fn hand_pixels(app: &AppHandle, label: &str, frozen: &FrozenCapture, slot: usize, generation: u64) {
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    let path = match frozen.screens.get(slot) {
+        Some(screen) if !screen.path.is_empty() => screen.path.as_str(),
+        _ if slot == 0 => frozen.path.as_str(),
+        _ => return,
+    };
+    crate::preview_buffer::post(&window, path, slot, generation);
 }
 
 fn note_overlay_hwnds(app: &AppHandle) {
@@ -960,6 +993,43 @@ fn dismiss_overlay(app: &AppHandle) {
             }
         }
     }
+    restore_foreground();
+}
+
+fn remember_foreground() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return;
+            }
+            let mut owner = 0u32;
+            let _ = GetWindowThreadProcessId(hwnd, Some(&mut owner));
+            if owner == 0 || owner == std::process::id() {
+                return;
+            }
+            if let Ok(mut slot) = PRIOR_FOREGROUND.lock() {
+                *slot = hwnd.0 as isize;
+            }
+        }
+    }
+}
+
+fn restore_foreground() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+        let raw = PRIOR_FOREGROUND.lock().ok().map(|mut slot| std::mem::replace(&mut *slot, 0)).unwrap_or(0);
+        if raw == 0 {
+            return;
+        }
+        unsafe {
+            let _ = SetForegroundWindow(HWND(raw as *mut std::ffi::c_void));
+        }
+    }
 }
 
 fn show_history(app: &AppHandle) -> Result<(), String> {
@@ -980,7 +1050,9 @@ fn show_history(app: &AppHandle) -> Result<(), String> {
 }
 
 fn show_settings(app: &AppHandle) -> Result<(), String> {
+    let size = LogicalSize::new(520.0, 680.0);
     if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.set_size(size);
         window.show().ok();
         window.unminimize().ok();
         window.set_focus().ok();
@@ -988,7 +1060,7 @@ fn show_settings(app: &AppHandle) -> Result<(), String> {
     }
     WebviewWindowBuilder::new(app, "settings", view_url("view=settings"))
         .title("Shotlet 设置")
-        .inner_size(560.0, 900.0)
+        .inner_size(size.width, size.height)
         .resizable(false)
         .center()
         .build()
@@ -1669,6 +1741,7 @@ pub fn switch_pin_group(app: &AppHandle) {
 
 const SCROLL_FRAME: &str = "scroll-frame";
 const SCROLL_HUD: &str = "scroll-hud";
+static SCROLL_HUD_PIN: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 const RECORD_BORDER: &str = "record-border";
 const HUD_W: f64 = 560.0;
 const HUD_H: f64 = 58.0;
@@ -1774,11 +1847,28 @@ pub fn show_overlay_labels(app: &AppHandle, labels: &[String]) {
 }
 
 pub fn close_scroll_chrome(app: &AppHandle) {
+    if let Ok(mut pin) = SCROLL_HUD_PIN.lock() {
+        *pin = None;
+    }
     for label in [SCROLL_FRAME, SCROLL_HUD] {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.destroy();
         }
     }
+}
+
+/// A click can make Windows reinterpret the HUD position. Put it back if it left the spot we chose.
+pub fn repin_scroll_hud(window: &WebviewWindow) {
+    let Some((x, y)) = SCROLL_HUD_PIN.lock().ok().and_then(|pin| *pin) else {
+        return;
+    };
+    let Ok(current) = window.outer_position() else {
+        return;
+    };
+    if (current.x - x).abs() <= 8 && (current.y - y).abs() <= 8 {
+        return;
+    }
+    let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
 pub fn open_scroll_chrome(
@@ -1897,6 +1987,9 @@ fn open_scroll_hud(
     let hud_w = (HUD_W * scale).round() as i32;
     let hud_h = (HUD_H * scale).round() as i32;
     let (x, y) = hud_place(sel_x, sel_y, sel_w, sel_h, screen_x, screen_y, screen_w, screen_h, hud_w, hud_h);
+    if let Ok(mut pin) = SCROLL_HUD_PIN.lock() {
+        *pin = Some((x, y));
+    }
     window.set_position(PhysicalPosition::new(x, y)).map_err(err)?;
     window.show().map_err(err)?;
     eprintln!("scroll: hud at {x},{y}");

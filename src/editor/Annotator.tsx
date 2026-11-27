@@ -2,7 +2,9 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { isDoubleClick } from "../lib/pin";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
 import { useI18n } from "../i18n";
-import { tracePage, type ShotImage } from "../api";
+import { ocrLines, ocrPng, tracePage, translateEnglishToChinese, type ShotImage } from "../api";
+import { hasChinese, parseNumberedTranslation, plainTranslation, replacementLayers, type LineBox } from "./replaceText";
+import { dockToolbar, type Dock } from "./dock";
 import { previewScale, renderPng, renderRgba, renderScene } from "./draw";
 import { appendStrokePoint, COLORS, hitTest, layerBounds, MAX_FONT, MIN_FONT, moveLayer, parseLayers, resizeBox, resizeTextLayer, uid, type Layer } from "./model";
 
@@ -26,6 +28,7 @@ type Props = {
     layers: Layer[],
     pngBytes: Uint8Array<ArrayBuffer>,
     baseBytes: Uint8Array<ArrayBuffer>,
+    ocrText?: string,
   ) => Promise<string | void>;
   onPlainCopy?: (selection: Rect) => Promise<boolean>;
   onPlainPin?: (selection: Rect) => Promise<boolean>;
@@ -51,8 +54,13 @@ export function Annotator(props: Props) {
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
+  const subRef = useRef<HTMLDivElement>(null);
+  const barBox = useRef({ w: 680, h: 44 });
+  const subBox = useRef({ w: 0, h: 0 });
+  const dockInput = useRef({ selection: props.selection, imageW: props.image.naturalWidth, imageH: props.image.naturalHeight });
+  dockInput.current = { selection: props.selection, imageW: props.image.naturalWidth, imageH: props.image.naturalHeight };
   const [frame, setFrame] = useState({ w: 0, h: 0 });
-  const [barSize, setBarSize] = useState({ w: 680, h: 44 });
+  const [dock, setDock] = useState<Dock | null>(null);
   const [tool, setTool] = useState<Tool>("select");
   const [color, setColor] = useState(COLORS[0]);
   const [thickness, setThickness] = useState(4);
@@ -71,6 +79,7 @@ export function Annotator(props: Props) {
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const [numbers, setNumbers] = useState(1);
   const [busy, setBusy] = useState(false);
+  const [ocrEngine, setOcrEngine] = useState<"local" | "ai">("local");
   const [note, setNote] = useState("");
   const [ocrText, setOcrText] = useState("");
   const [cropping, setCropping] = useState(false);
@@ -116,14 +125,38 @@ export function Annotator(props: Props) {
     const measure = () => {
       const rect = stage.getBoundingClientRect();
       setFrame((prev) => (prev.w === rect.width && prev.h === rect.height ? prev : { w: rect.width, h: rect.height }));
+      if (!props.desktop || rect.width < 2 || rect.height < 2) return;
+      const maxWidth = Math.max(1, rect.width - 16);
       const bar = barRef.current;
-      if (bar) setBarSize((prev) => (prev.w === bar.offsetWidth && prev.h === bar.offsetHeight ? prev : { w: bar.offsetWidth, h: bar.offsetHeight }));
+      if (bar) {
+        const next = fittedBox(bar, maxWidth);
+        if (next.w >= 8 && next.h >= 8) barBox.current = next;
+      }
+      const sub = subRef.current;
+      subBox.current = sub ? fittedBox(sub, maxWidth) : { w: 0, h: 0 };
+      placeDock(rect);
     };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(stage);
     return () => observer.disconnect();
-  }, [tool, props.mode]);
+  }, [tool, selected, props.mode, props.desktop, props.image.naturalWidth, props.image.naturalHeight]);
+
+  useLayoutEffect(() => {
+    const stage = stageRef.current;
+    if (!props.desktop || !stage) return;
+    placeDock(stage.getBoundingClientRect());
+  }, [props.desktop, props.selection, props.image.naturalWidth, props.image.naturalHeight]);
+
+  function placeDock(rect: { width: number; height: number }) {
+    if (rect.width < 2 || rect.height < 2) return;
+    const input = dockInput.current;
+    const sx = rect.width / Math.max(input.imageW, 1);
+    const sy = rect.height / Math.max(input.imageH, 1);
+    const sel = input.selection;
+    const next = dockToolbar(sel.x * sx, sel.y * sy, sel.w * sx, sel.h * sy, rect.width, rect.height, barBox.current.w, barBox.current.h, subBox.current.h);
+    setDock((prev) => (prev && sameDock(prev, next) ? prev : next));
+  }
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
@@ -649,9 +682,77 @@ export function Annotator(props: Props) {
     commitText();
   }
 
+  function placeTranslation(lines: LineBox[], texts: string[], note: string) {
+    const patches = replacementLayers(
+      lines,
+      texts,
+      props.selection.x,
+      props.selection.y,
+      props.image.pixels ?? null,
+      props.image.naturalWidth,
+      props.image.naturalHeight,
+    );
+    if (patches.length === 0) {
+      setOcrText(plainTranslation(texts));
+      setNote(t("translateLoose"));
+      return;
+    }
+    push([...layersRef.current, ...patches]);
+    setOcrText("");
+    void navigator.clipboard.writeText(plainTranslation(texts)).catch(() => undefined);
+    setNote(note);
+  }
+
+  async function translateSelection() {
+    if (busy) return;
+      setBusy(true);
+    setNote(t("recognizing"));
+    try {
+      const rendered = await renderPng(props.image, props.selection, layers, true);
+      const found = await ocrLines(rendered.bytes);
+      const english = found
+        .filter((line) => /[A-Za-z]/.test(line.text) && line.w >= 2 && line.h >= 2)
+        .sort((left, right) => left.y - right.y || left.x - right.x);
+      if (english.length === 0) {
+        setOcrText("");
+        setNote(t("ocrEmpty"));
+        return;
+      }
+      setNote(t("translating"));
+      const batches: LineBox[][] = [];
+      for (let index = 0; index < english.length; index += 8) batches.push(english.slice(index, index + 8));
+      let painted = 0;
+      let queue = Promise.resolve();
+      const copied: string[] = [];
+      await Promise.all(batches.map(async (batch) => {
+        const numbered = batch.map((line, index) => `${index + 1}. ${line.text.replace(/\s+/g, " ").trim()}`).join("\n");
+        const raw = await translateEnglishToChinese(numbered);
+        const chinese = parseNumberedTranslation(raw, batch.length);
+        if (!chinese || !hasChinese(chinese)) return;
+        const run = queue.then(() => {
+          placeTranslation(batch, chinese, t("translating"));
+          painted += 1;
+          copied.push(...chinese);
+        });
+        queue = run.then(() => undefined, () => undefined);
+        await run;
+      }));
+      if (painted === 0) {
+        setNote(t("translateEnglish"));
+        return;
+      }
+      void navigator.clipboard.writeText(plainTranslation(copied)).catch(() => undefined);
+      setNote(t("translated"));
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function run(action: Action, selection = props.selection) {
     setBusy(true);
-    setNote("");
+    setNote(action === "ocr" ? (ocrEngine === "ai" ? t("seeing") : t("recognizing")) : "");
     try {
       commitText();
       const marks = layersRef.current;
@@ -686,7 +787,8 @@ export function Annotator(props: Props) {
       const baseResult = action === "pin"
         ? { base64: "", bytes: rendered.bytes }
         : (baseTask ? await baseTask : rendered);
-      const text = await props.onAction(action, rendered.base64, baseResult.base64, marks, rendered.bytes, baseResult.bytes);
+      const recognized = action === "ocr" ? await ocrPng(rendered.bytes, ocrEngine) : "";
+      const text = await props.onAction(action, rendered.base64, baseResult.base64, marks, rendered.bytes, baseResult.bytes, recognized);
       if (action === "ocr") {
         const value = typeof text === "string" ? text.trim() : "";
         setOcrText(value);
@@ -757,8 +859,7 @@ export function Annotator(props: Props) {
   const selectedLayer = layers.find((item) => item.id === selected) ?? null;
   const textSelected = selectedLayer?.type === "text";
   const textScreen = selectedLayer?.type === "text" ? layerScreenBox(layerBounds(selectedLayer), props.selection, box) : null;
-  const dock = props.desktop ? dockBar(props.selection, props.image, barSize.w, barSize.h) : null;
-  const dockStyle = dock ? { left: dock.left, top: dock.top, bottom: "auto", transform: "none" } : undefined;
+  const dockStyle = props.desktop && dock ? { left: dock.left, top: dock.top, width: dock.width, maxWidth: dock.width, bottom: "auto", right: "auto", transform: "none", boxSizing: "border-box" as const } : undefined;
 
   return (
     <div className={props.desktop ? "anno-layer" : "editor-root"}>
@@ -850,7 +951,12 @@ export function Annotator(props: Props) {
           <button title={t("crop")} className={cropping ? "on wide" : "wide"} onClick={() => { setCropping((value) => !value); setCrop(null); }}>{t("crop")}</button>
         )}
         {cropping && crop && props.onCrop && <button className="wide" onClick={() => props.onCrop?.(crop)}>{t("apply")}</button>}
+        <select className="ocr-engine" title={t("ocr")} value={ocrEngine} onChange={(event) => setOcrEngine(event.target.value as "local" | "ai")}>
+          <option value="local">{t("ocrLocal")}</option>
+          <option value="ai">{t("ocrAi")}</option>
+        </select>
         <button className="wide" title={t("ocr")} onClick={() => void run("ocr")}>OCR</button>
+        <button className="wide" title={t("translateHint")} onClick={() => void translateSelection()}>{t("translate")}</button>
         <span className="split" />
         <button title={t("pin")} onClick={() => void run("pin")}><ToolIcon name="pin" /></button>
         <button title={t("save")} onClick={() => void run("save")}><ToolIcon name="save" /></button>
@@ -858,7 +964,7 @@ export function Annotator(props: Props) {
         <button className="check" title={t("copy")} onClick={() => void run("copy")}><ToolIcon name="check" /></button>
       </div>
       {((tool !== "select" && tool !== "number") || textSelected) && (
-        <div className="subbar" onPointerDown={holdTextFocus} onPointerUp={releaseTextFocus} onPointerCancel={releaseTextFocus} style={dock ? { left: dock.left, top: dock.subTop, bottom: "auto", transform: "none" } : undefined}>
+        <div className="subbar" ref={subRef} onPointerDown={holdTextFocus} onPointerUp={releaseTextFocus} onPointerCancel={releaseTextFocus} style={props.desktop && dock ? { left: dock.left, top: dock.subTop, width: dock.width, maxWidth: dock.width, bottom: "auto", right: "auto", transform: "none", boxSizing: "border-box" } : undefined}>
           {(tool !== "select" && tool !== "number" || textSelected || textDraft) && COLORS.map((swatch) => (
             <button key={swatch} className={(selectedLayer?.type === "highlight" ? selectedLayer.color ?? color : color) === swatch ? "swatch on" : "swatch"} style={{ background: swatch }} onMouseDown={(event) => event.preventDefault()} onClick={() => changeColor(swatch)} />
           ))}
@@ -892,12 +998,8 @@ export function Annotator(props: Props) {
       )}
       {(note || ocrText || busy) && (
         <div className="note ocr-result">
-          {busy ? <span>{t("busy")}</span> : (
-            <>
-              {note && <b>{note}</b>}
-              {ocrText && <span>{ocrText}</span>}
-            </>
-          )}
+          {note ? <b>{note}</b> : <span>{t("busy")}</span>}
+          {!busy && ocrText && <span>{ocrText}</span>}
         </div>
       )}
     </div>
@@ -912,25 +1014,47 @@ function selectionCss(selection: Rect, image: ShotImage, frame: { w: number; h: 
   return { left: selection.x * sx, top: selection.y * sy, width: Math.max(0, selection.w * sx), height: Math.max(0, selection.h * sy) };
 }
 
-function dockBar(selection: Rect, image: ShotImage, barW: number, barH: number) {
-  const viewW = Math.max(window.innerWidth, 1);
-  const viewH = Math.max(window.innerHeight, 1);
-  const sx = viewW / Math.max(image.naturalWidth, 1);
-  const sy = viewH / Math.max(image.naturalHeight, 1);
-  const selLeft = selection.x * sx;
-  const selTop = selection.y * sy;
-  const selWidth = selection.w * sx;
-  const selHeight = selection.h * sy;
-  const margin = 10;
-  const width = Math.min(Math.max(barW, 1), Math.max(120, viewW - margin * 2));
-  let left = selLeft + selWidth / 2 - width / 2;
-  left = Math.max(margin, Math.min(left, viewW - margin - width));
-  let top = selTop + selHeight + 12;
-  if (top + barH > viewH - margin) top = selTop - 12 - barH;
-  if (top < margin) top = Math.max(margin, viewH - margin - barH);
-  let subTop = top - 48;
-  if (subTop < margin) subTop = top + barH + 8;
-  return { left, top, subTop };
+function sameDock(prev: Dock, next: Dock): boolean {
+  return prev.left === next.left && prev.top === next.top && prev.width === next.width && prev.height === next.height && prev.subTop === next.subTop;
+}
+
+function fittedBox(node: HTMLElement, maxWidth: number): { w: number; h: number } {
+  const previous = {
+    width: node.style.width,
+    maxWidth: node.style.maxWidth,
+    flexWrap: node.style.flexWrap,
+    left: node.style.left,
+    right: node.style.right,
+    top: node.style.top,
+    bottom: node.style.bottom,
+    transform: node.style.transform,
+    boxSizing: node.style.boxSizing,
+  };
+  node.style.boxSizing = "border-box";
+  node.style.left = "0px";
+  node.style.right = "auto";
+  node.style.top = "0px";
+  node.style.bottom = "auto";
+  node.style.transform = "none";
+  node.style.flexWrap = "nowrap";
+  node.style.maxWidth = "none";
+  node.style.width = "max-content";
+  const unwrapped = Math.ceil(node.offsetWidth);
+  const width = Math.min(Math.max(unwrapped, 1), Math.max(1, maxWidth));
+  node.style.width = `${width}px`;
+  node.style.maxWidth = `${width}px`;
+  node.style.flexWrap = unwrapped > maxWidth ? "wrap" : "nowrap";
+  const height = Math.ceil(node.offsetHeight);
+  node.style.width = previous.width;
+  node.style.maxWidth = previous.maxWidth;
+  node.style.flexWrap = previous.flexWrap;
+  node.style.left = previous.left;
+  node.style.right = previous.right;
+  node.style.top = previous.top;
+  node.style.bottom = previous.bottom;
+  node.style.transform = previous.transform;
+  node.style.boxSizing = previous.boxSizing;
+  return { w: width, h: Math.max(1, height) };
 }
 
 function Shade({ box }: { box: { left: number; top: number; width: number; height: number } }) {

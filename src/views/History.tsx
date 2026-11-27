@@ -102,7 +102,15 @@ export function History() {
       <footer>
         <button onClick={() => selected.length ? void run(() => deleteCaptures(selected)) : setMessage(t("selectSome"))}>{t("delete")}</button>
         <button onClick={() => selected.length ? void run(() => restoreCaptures(selected)) : setMessage(t("selectSome"))}>{t("restore")}</button>
-        <button onClick={() => void run(() => purgeDeleted())}>{t("purge")}</button>
+        <button onClick={() => void run(async () => {
+          const trashed = await listHistory("", "deleted");
+          if (trashed.length === 0) {
+            setMessage(t("trashEmpty"));
+            return;
+          }
+          await purgeDeleted();
+          setMessage(t("trashCleared").replace("%s", String(trashed.length)));
+        })}>{t("purge")}</button>
         <button onClick={() => void run(async () => {
           if (selected.length === 0) throw new Error(t("selectSome"));
           const dest = await pickDirectory();

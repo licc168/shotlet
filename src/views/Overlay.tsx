@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Annotator } from "../editor/Annotator";
-import { aimOverlay, cancelCapture, commitHistory, commitHistoryRaw, copyAnnotatedRaw, copyCaptureRegion, copyPngBase64, copyPngRaw, currentCapture, isTauri, loadFrozen, ocrPng, onEvent, openRecording, overlayReady, pinAnnotated, pinAnnotatedRgba, pinCaptureRegion, pinHistory, pickSavePath, scrollCapture, setOverlayFollow, writePng, type ShotImage } from "../api";
+import { aimOverlay, cancelCapture, commitHistory, commitHistoryRaw, copyAnnotatedRaw, copyCaptureRegion, copyPngBase64, copyPngRaw, currentCapture, isTauri, loadFrozen, ocrPng, onEvent, openRecording, overlayReady, pinAnnotated, pinAnnotatedRgba, pinCaptureRegion, pinHistory, pickSavePath, scrollCapture, setOverlayFollow, waitPreviewFrame, writePng, type ShotImage } from "../api";
 import { screenCssSize } from "../editor/draw";
 import { useI18n } from "../i18n";
 import { clampRect, contains, isDragGlitch, normalize, square, type Rect } from "../lib/selection";
@@ -130,7 +130,7 @@ export function Overlay() {
       if (typeof payload?.slot === "number" && payload.slot !== slot) return;
       if (typeof payload?.armed === "boolean") setArmed(payload.armed);
       const pixels = payload?.path && payload.width && payload.height
-        ? loadFrozen(payload.path, payload.width, payload.height).catch(() => null)
+        ? waitPreviewFrame(payload.slot ?? slot, payload.generation ?? 0, 400).then((shot) => shot ?? loadFrozen(payload.path!, payload.width!, payload.height!)).catch(() => null)
         : Promise.resolve(null);
       void Promise.all([currentCapture(), pixels]).then(([frozen, loaded]) => {
         if (payload?.generation != null && (frozen?.generation ?? 0) !== payload.generation) {
@@ -531,14 +531,14 @@ export function Overlay() {
               setError(reason instanceof Error ? reason.message : String(reason));
             });
           }}
-          onAction={async (action, png, base, layers, pngBytes, baseBytes) => {
+          onAction={async (action, png, base, layers, pngBytes, baseBytes, recognized) => {
             if (action === "copy" && isTauri()) {
               await copyAnnotatedRaw(png, JSON.stringify(layers), pngBytes, baseBytes);
               await cancelCapture();
               return "";
             }
             let ocrText = "";
-            if (action === "ocr") ocrText = await ocrPng(pngBytes);
+            if (action === "ocr") ocrText = recognized?.trim() || await ocrPng(pngBytes);
             if (action === "pin") {
               await pinAnnotated(
                 png,

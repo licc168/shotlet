@@ -504,9 +504,47 @@ export async function ocrPngBase64(data: string): Promise<string> {
   return call<string>("ocr_png_base64", { data });
 }
 
-/** OCR a PNG without a Base64 round trip. The body is raw PNG bytes. */
-export async function ocrPng(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+/** Translate recognized English with the model saved in settings. */
+export async function translateEnglishToChinese(text: string): Promise<string> {
+  const source = text.trim();
+  if (!source) return "";
+  if (!isTauri()) throw new Error("请先在设置里配置模型");
+  const translated = (await call<string>("ai_translate", { text: source })).trim();
+  if (!translated) throw new Error("模型没有返回译文");
+  return translated;
+}
+
+/** Ask the configured model to look at a screenshot. `ocr` reads the original text. `translate` returns positioned Chinese lines. */
+export async function seeImage(bytes: Uint8Array<ArrayBuffer>, mode: "ocr" | "translate"): Promise<string> {
+  if (!isTauri()) throw new Error("请先在设置里配置模型");
+  return invoke<string>("ai_see", bytes, { headers: { "x-shotlet-see": mode } });
+}
+
+export async function listAiModels(config: { provider: string; endpoint: string; apiKey: string; model: string }): Promise<string[]> {
+  if (!isTauri()) return [];
+  return call<string[]>("ai_models", { config });
+}
+
+export async function testAi(config: { provider: string; endpoint: string; apiKey: string; model: string }): Promise<string> {
+  if (!isTauri()) throw new Error("请先在设置里配置模型");
+  return call<string>("ai_test", { config });
+}
+
+export type OcrLine = { text: string; x: number; y: number; w: number; h: number };
+
+/** OCR lines with boxes, in the PNG's pixel space. */
+export async function ocrLines(bytes: Uint8Array<ArrayBuffer>): Promise<OcrLine[]> {
+  if (!isTauri()) return [];
+  return invoke<OcrLine[]>("ocr_lines_raw", bytes);
+}
+
+export async function ocrPng(bytes: Uint8Array<ArrayBuffer>, engine: "local" | "ai" = "local"): Promise<string> {
   if (!isTauri()) return "Shotlet";
+  if (engine === "ai") {
+    const text = (await seeImage(bytes, "ocr")).trim();
+    if (!text) throw new Error("模型没有识别到文字");
+    return text;
+  }
   return invoke<string>("ocr_png_raw", bytes);
 }
 
@@ -608,9 +646,14 @@ export async function cancelScroll(): Promise<void> {
   await call("scroll_cancel");
 }
 
-export async function scrollProgress(): Promise<{ height: number; reverse: boolean }> {
-  if (!isTauri()) return { height: 0, reverse: false };
+export async function scrollProgress(): Promise<{ height: number; reverse: boolean; auto: boolean; canAuto: boolean }> {
+  if (!isTauri()) return { height: 0, reverse: false, auto: false, canAuto: false };
   return call("scroll_progress");
+}
+
+export async function setScrollAuto(enabled: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await call("set_scroll_auto", { enabled });
 }
 
 export async function ffmpegAvailable(): Promise<boolean> {
@@ -720,6 +763,110 @@ function imagePixels(raw: Uint8Array): Uint8ClampedArray<ArrayBuffer> {
   const copy = new Uint8ClampedArray(raw.byteLength);
   copy.set(raw);
   return copy;
+}
+
+type PreviewFrame = { slot: number; generation: number; path: string; width: number; height: number; pixels: Uint8ClampedArray<ArrayBuffer> };
+
+type SharedBufferEvent = Event & {
+  additionalData?: PreviewFrame | string;
+  getBuffer: () => ArrayBuffer;
+};
+
+type ChromeWebview = {
+  addEventListener(type: "sharedbufferreceived", listener: (event: SharedBufferEvent) => void): void;
+  removeEventListener(type: "sharedbufferreceived", listener: (event: SharedBufferEvent) => void): void;
+  releaseBuffer(buffer: ArrayBuffer): void;
+};
+
+type PreviewHost = Window & { __shotletPreview?: (event: SharedBufferEvent) => void };
+
+const previewInbox: PreviewFrame[] = [];
+const previewWaiters = new Set<(frame: PreviewFrame) => void>();
+let previewListening = false;
+
+function chromeWebview(): ChromeWebview | null {
+  const host = window as Window & { chrome?: { webview?: ChromeWebview } };
+  return host.chrome?.webview ?? null;
+}
+
+function rememberFrame(frame: PreviewFrame) {
+  previewInbox.push(frame);
+  if (previewInbox.length > 6) previewInbox.shift();
+  for (const waiter of previewWaiters) waiter(frame);
+}
+
+function installPreviewFrames(webview: ChromeWebview) {
+  const host = window as PreviewHost;
+  if (previewListening && host.__shotletPreview) return;
+  if (host.__shotletPreview) webview.removeEventListener("sharedbufferreceived", host.__shotletPreview);
+  const listener = (event: SharedBufferEvent) => {
+    const meta = typeof event.additionalData === "string" ? JSON.parse(event.additionalData) as PreviewFrame : event.additionalData;
+    let shared: ArrayBuffer;
+    try {
+      shared = event.getBuffer();
+    } catch {
+      return;
+    }
+    // A hot reload can leave an older listener that already released this buffer.
+    if (shared.byteLength === 0) return;
+    try {
+      const view = new Uint8Array(shared);
+      const pixels = new Uint8ClampedArray(view.byteLength);
+      pixels.set(view);
+      webview.releaseBuffer(shared);
+      if (!meta || !(meta.width > 0) || !(meta.height > 0)) return;
+      if (pixels.byteLength !== meta.width * meta.height * 4) return;
+      rememberFrame({ slot: meta.slot, generation: meta.generation, path: meta.path, width: meta.width, height: meta.height, pixels });
+    } catch {
+      try {
+        webview.releaseBuffer(shared);
+      } catch {
+        // The buffer was already released.
+      }
+    }
+  };
+  host.__shotletPreview = listener;
+  previewListening = true;
+  webview.addEventListener("sharedbufferreceived", listener);
+}
+
+function shotFromPixels(pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, stage: string): ShotImage | null {
+  const canvas = document.createElement("canvas");
+  if (!paintPixels(canvas, pixels, width, height)) return null;
+  tracePage(stage);
+  const shot = canvas as HTMLCanvasElement & ShotImage;
+  shot.naturalWidth = width;
+  shot.naturalHeight = height;
+  shot.src = "";
+  shot.pixels = pixels;
+  return shot;
+}
+
+/** Pixels posted straight into this page. `null` means this window has no shared-buffer channel. */
+export function waitPreviewFrame(slot: number, generation: number, timeoutMs: number): Promise<ShotImage | null> {
+  const webview = chromeWebview();
+  if (!webview) return Promise.resolve(null);
+  installPreviewFrames(webview);
+  const ready = previewInbox.find((frame) => frame.slot === slot && frame.generation === generation);
+  if (ready) return Promise.resolve(shotFromPixels(ready.pixels, ready.width, ready.height, "f1: buffer painted"));
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => {
+      previewWaiters.delete(onFrame);
+      resolve(null);
+    }, timeoutMs);
+    const onFrame = (frame: PreviewFrame) => {
+      if (frame.slot !== slot || frame.generation !== generation) return;
+      window.clearTimeout(timer);
+      previewWaiters.delete(onFrame);
+      resolve(shotFromPixels(frame.pixels, frame.width, frame.height, "f1: buffer painted"));
+    };
+    previewWaiters.add(onFrame);
+  });
+}
+
+if (typeof window !== "undefined") {
+  const webview = chromeWebview();
+  if (webview) installPreviewFrames(webview);
 }
 
 export function paintPixels(canvas: HTMLCanvasElement, pixels: Uint8ClampedArray<ArrayBuffer>, width: number, height: number, opaque = true): boolean {

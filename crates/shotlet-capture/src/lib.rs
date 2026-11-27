@@ -152,6 +152,11 @@ fn preview_cache() -> &'static Mutex<PreviewCache> {
     })
 }
 
+/// The cached frame, without copying its pixels. The overlay paints from this.
+pub fn preview_image(path: &str) -> Option<Arc<RgbaImage>> {
+    preview_cache().lock().ok()?.images.get(path).map(Arc::clone)
+}
+
 pub fn remember_preview(key: &str, image: Arc<RgbaImage>) {
     if let Ok(mut cache) = preview_cache().lock() {
         store_preview(&mut cache, key.to_string(), image);

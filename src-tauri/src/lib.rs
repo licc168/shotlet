@@ -2,6 +2,12 @@ pub use shotlet_core::{capture, history, ocr, pin_session, record, scroll, setti
 
 #[cfg(target_os = "macos")]
 mod hotkey_mac;
+#[cfg(windows)]
+mod preview_buffer;
+#[cfg(not(windows))]
+#[path = "preview_buffer_noop.rs"]
+mod preview_buffer;
+mod ai;
 mod commands;
 mod ui;
 
@@ -39,6 +45,10 @@ pub fn run() {
             commands::open_settings,
             commands::get_settings,
             commands::save_settings,
+            commands::ai_test,
+            commands::ai_models,
+            commands::ai_translate,
+            commands::ai_see,
             commands::list_history,
             commands::commit_history,
             commands::commit_history_raw,
@@ -73,12 +83,14 @@ pub fn run() {
             commands::preview_rgba,
             commands::ocr_png_base64,
             commands::ocr_png_raw,
+            commands::ocr_lines_raw,
             commands::open_editor_record,
             commands::current_editor,
             commands::scroll_capture,
             commands::scroll_finish,
             commands::scroll_cancel,
             commands::scroll_progress,
+            commands::set_scroll_auto,
             commands::ffmpeg_available,
             commands::open_recording,
             commands::begin_recording,
@@ -117,9 +129,18 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             match event {
+                WindowEvent::Focused(true) if window.label() == "scroll-hud" => {
+                    if let Some(hud) = window.get_webview_window("scroll-hud") {
+                        ui::repin_scroll_hud(&hud);
+                    }
+                }
                 WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
                     api.prevent_close();
+                    ui::note_home_dismissed();
                     let _ = window.hide();
+                }
+                WindowEvent::Focused(true) if window.label() == "main" => {
+                    ui::hide_home_if_dismissed(window);
                 }
                 WindowEvent::Destroyed if window.label() == "recorder" => {
                     let app = window.app_handle().clone();

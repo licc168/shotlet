@@ -410,6 +410,10 @@ pub fn recognize_png_bytes(bytes: &[u8]) -> Result<String, String> {
     Ok(text)
 }
 
+pub fn recognize_line_boxes(bytes: &[u8]) -> Result<Vec<ocr::TextLine>, String> {
+    ocr::recognize_line_boxes(bytes)
+}
+
 pub fn read_image_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path).map_err(err)?;
     if !meta.is_file() {

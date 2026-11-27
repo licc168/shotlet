@@ -18,7 +18,7 @@ export function renderScene(
   // The live preview leaves the photo on the <img> under this canvas.
   // Drawing it again resamples the selection and looks softer than that photo.
   if (paintBase) paintPhoto(ctx, image, selection);
-  paintMarks(ctx, layers, selection);
+  paintMarks(ctx, layers, selection, viewScale);
   const mosaics = layers.filter((layer) => layer.type === "mosaic");
   if (mosaics.length === 0) return;
   const snapshot = paintBase
@@ -39,17 +39,67 @@ export function renderScene(
   blitMasked(ctx, snapshot);
 }
 
+/** Fill and text are rasterized at device pixels. A fractional canvas scale would blur the glyphs. */
+function paintDeviceRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  color: string,
+  selection: Rect,
+  viewScale: number,
+) {
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = color;
+  ctx.fillRect(
+    Math.round((x - selection.x) * viewScale),
+    Math.round((y - selection.y) * viewScale),
+    Math.max(1, Math.round(w * viewScale)),
+    Math.max(1, Math.round(h * viewScale)),
+  );
+  ctx.restore();
+}
+
+function paintDeviceText(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  text: string,
+  color: string,
+  size: number,
+  selection: Rect,
+  viewScale: number,
+) {
+  const scale = viewScale > 0 ? viewScale : 1;
+  const px = Math.max(1, Math.round(size * scale));
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = color;
+  ctx.font = `${px}px "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif`;
+  ctx.textBaseline = "top";
+  text.split("\n").forEach((line, index) => {
+    ctx.fillText(
+      line,
+      Math.round((x - selection.x) * scale),
+      Math.round((y - selection.y) * scale + index * px * 1.25),
+    );
+  });
+  ctx.restore();
+}
+
 function paintPhoto(ctx: CanvasRenderingContext2D, image: CanvasImageSource, selection: Rect) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(image, selection.x, selection.y, selection.w, selection.h, 0, 0, selection.w, selection.h);
 }
 
-function paintMarks(ctx: CanvasRenderingContext2D, layers: Layer[], selection: Rect) {
+function paintMarks(ctx: CanvasRenderingContext2D, layers: Layer[], selection: Rect, viewScale: number) {
   ctx.save();
   ctx.translate(-selection.x, -selection.y);
   for (const layer of layers) {
-    if (layer.type !== "mosaic") drawLayer(ctx, layer, selection);
+    if (layer.type !== "mosaic") drawLayer(ctx, layer, selection, viewScale);
   }
   ctx.restore();
 }
@@ -69,7 +119,7 @@ function sampleScene(
   if (!sample) return new ImageData(width, height);
   sample.setTransform(viewScale, 0, 0, viewScale, 0, 0);
   paintPhoto(sample, image, selection);
-  paintMarks(sample, layers, selection);
+  paintMarks(sample, layers, selection, viewScale);
   return sample.getImageData(0, 0, width, height);
 }
 
@@ -84,13 +134,17 @@ function blitMasked(ctx: CanvasRenderingContext2D, snapshot: ImageData) {
   ctx.drawImage(canvas, 0, 0);
 }
 
-function drawLayer(ctx: CanvasRenderingContext2D, layer: Exclude<Layer, { type: "mosaic" }>, selection: Rect) {
+function drawLayer(ctx: CanvasRenderingContext2D, layer: Exclude<Layer, { type: "mosaic" }>, selection: Rect, viewScale: number) {
   ctx.save();
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
   switch (layer.type) {
     case "rect":
     case "ellipse":
+      if (layer.type === "rect" && layer.filled) {
+        paintDeviceRect(ctx, layer.x, layer.y, layer.w, layer.h, layer.color, selection, viewScale);
+        break;
+      }
       traceShape(ctx, layer);
       ctx.strokeStyle = layer.color;
       ctx.fillStyle = layer.color;
@@ -110,12 +164,7 @@ function drawLayer(ctx: CanvasRenderingContext2D, layer: Exclude<Layer, { type: 
       ctx.fill();
       break;
     case "text":
-      ctx.fillStyle = layer.color;
-      ctx.font = `${layer.size}px "Segoe UI", sans-serif`;
-      ctx.textBaseline = "top";
-      layer.text.split("\n").forEach((line, index) => {
-        ctx.fillText(line, layer.x, layer.y + index * layer.size * 1.25);
-      });
+      paintDeviceText(ctx, layer.x, layer.y, layer.text, layer.color, layer.size, selection, viewScale);
       break;
     case "number":
       ctx.beginPath();

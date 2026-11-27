@@ -101,18 +101,68 @@ impl Drop for MtaGuard {
     }
 }
 
+/// One recognized line, in the source image's pixel space.
+pub struct TextLine {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Lines with boxes, so the page can paint a translation over the original words.
+pub fn recognize_line_boxes(bytes: &[u8]) -> Result<Vec<TextLine>, String> {
+    #[cfg(windows)]
+    {
+        let bytes = bytes.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("shotlet-ocr".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _guard = MtaGuard::enter()?;
+                    recognize_windows_lines(&bytes)
+                }));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => Err("文字识别中断".into()),
+                };
+                let _ = tx.send(result);
+            })
+            .map_err(err)?;
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("文字识别超时".into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("文字识别中断".into()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = bytes;
+        Err("按行替换文字目前只在 Windows 上可用".into())
+    }
+}
+
 #[cfg(windows)]
-fn recognize_windows(png: &[u8]) -> Result<String, String> {
+struct OcrBitmap {
+    bitmap: windows::Graphics::Imaging::SoftwareBitmap,
+    scale_x: f32,
+    scale_y: f32,
+}
+
+#[cfg(windows)]
+fn ocr_bitmap(png: &[u8]) -> Result<Option<OcrBitmap>, String> {
     use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::DataWriter;
 
-    let image = load_rgba(png)?;
+    let source = load_rgba(png)?;
+    let (source_w, source_h) = source.dimensions();
     let max_side = OcrEngine::MaxImageDimension().map_err(err)?.max(1);
-    let image = fit_within(image, max_side);
+    let image = fit_within(source, max_side);
     let (width, height) = image.dimensions();
-    if width == 0 || height == 0 {
-        return Ok(String::new());
+    if width == 0 || height == 0 || source_w == 0 || source_h == 0 {
+        return Ok(None);
     }
 
     let mut bgra = Vec::with_capacity((width as usize) * (height as usize) * 4);
@@ -132,8 +182,20 @@ fn recognize_windows(png: &[u8]) -> Result<String, String> {
         BitmapAlphaMode::Premultiplied,
     )
     .map_err(err)?;
+    Ok(Some(OcrBitmap {
+        bitmap,
+        scale_x: source_w as f32 / width as f32,
+        scale_y: source_h as f32 / height as f32,
+    }))
+}
+
+#[cfg(windows)]
+fn recognize_windows(png: &[u8]) -> Result<String, String> {
+    let Some(prepared) = ocr_bitmap(png)? else {
+        return Ok(String::new());
+    };
     let engine = ocr_engine()?;
-    let result = engine.RecognizeAsync(&bitmap).map_err(err)?.join().map_err(err)?;
+    let result = engine.RecognizeAsync(&prepared.bitmap).map_err(err)?.join().map_err(err)?;
     let text = result.Text().map_err(err)?.to_string();
     let text = text.trim().to_string();
     if !text.is_empty() {
@@ -150,6 +212,53 @@ fn recognize_windows(png: &[u8]) -> Result<String, String> {
         }
     }
     Ok(parts.join("\n"))
+}
+
+#[cfg(windows)]
+fn recognize_windows_lines(png: &[u8]) -> Result<Vec<TextLine>, String> {
+    let Some(prepared) = ocr_bitmap(png)? else {
+        return Ok(Vec::new());
+    };
+    let engine = ocr_engine()?;
+    let result = engine.RecognizeAsync(&prepared.bitmap).map_err(err)?.join().map_err(err)?;
+    let lines = result.Lines().map_err(err)?;
+    let count = lines.Size().map_err(err)?;
+    let mut found = Vec::new();
+    for index in 0..count {
+        let line = lines.GetAt(index).map_err(err)?;
+        let text = line.Text().map_err(err)?.to_string();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let words = line.Words().map_err(err)?;
+        let word_count = words.Size().map_err(err)?;
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for word_index in 0..word_count {
+            let bounds = words.GetAt(word_index).map_err(err)?.BoundingRect().map_err(err)?;
+            if bounds.Width <= 0.0 || bounds.Height <= 0.0 {
+                continue;
+            }
+            min_x = min_x.min(bounds.X);
+            min_y = min_y.min(bounds.Y);
+            max_x = max_x.max(bounds.X + bounds.Width);
+            max_y = max_y.max(bounds.Y + bounds.Height);
+        }
+        if max_x <= min_x || max_y <= min_y {
+            continue;
+        }
+        found.push(TextLine {
+            text,
+            x: min_x * prepared.scale_x,
+            y: min_y * prepared.scale_y,
+            w: (max_x - min_x) * prepared.scale_x,
+            h: (max_y - min_y) * prepared.scale_y,
+        });
+    }
+    Ok(found)
 }
 
 #[cfg(windows)]

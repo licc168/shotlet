@@ -18,6 +18,9 @@ fn default_pin() -> String { DEFAULT_PIN_SHORTCUT.into() }
 fn default_hide_pins() -> String { DEFAULT_HIDE_PINS_SHORTCUT.into() }
 fn default_pin_group() -> String { DEFAULT_PIN_GROUP_SHORTCUT.into() }
 fn default_history() -> String { DEFAULT_HISTORY_SHORTCUT.into() }
+fn default_ai_provider() -> String { "deepseek".into() }
+fn default_ai_endpoint() -> String { "https://api.deepseek.com/v1".into() }
+fn default_ai_model() -> String { "deepseek-v4-flash".into() }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +107,14 @@ pub struct Settings {
     #[serde(default)]
     pub copy_latest_shortcut: String,
     pub storage_dir: String,
+    #[serde(default = "default_ai_provider")]
+    pub ai_provider: String,
+    #[serde(default = "default_ai_endpoint")]
+    pub ai_endpoint: String,
+    #[serde(default)]
+    pub ai_api_key: String,
+    #[serde(default = "default_ai_model")]
+    pub ai_model: String,
 }
 
 impl Default for Settings {
@@ -120,6 +131,10 @@ impl Default for Settings {
             history_shortcut: default_history(),
             copy_latest_shortcut: String::new(),
             storage_dir: String::new(),
+            ai_provider: default_ai_provider(),
+            ai_endpoint: default_ai_endpoint(),
+            ai_api_key: String::new(),
+            ai_model: default_ai_model(),
         }
     }
 }

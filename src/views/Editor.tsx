@@ -79,9 +79,9 @@ export function Editor() {
         fileBacked.current = false;
         cropImage(image, rect).then((next) => replaceImage(next, [])).catch(() => undefined);
       }}
-      onAction={async (action, png, base, layers, pngBytes, baseBytes) => {
+      onAction={async (action, png, base, layers, pngBytes, baseBytes, recognized) => {
         let ocrText = "";
-        if (action === "ocr") ocrText = await ocrPng(pngBytes);
+        if (action === "ocr") ocrText = recognized?.trim() || await ocrPng(pngBytes);
         if (action === "copy") await copyPngRaw(png, pngBytes);
         const body = { pngBase64: png, basePngBase64: base, document: JSON.stringify(layers), ocrText, width: image.naturalWidth, height: image.naturalHeight, name: "" };
         const item = recordId

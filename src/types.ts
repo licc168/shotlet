@@ -10,6 +10,10 @@ export type Settings = {
   historyShortcut: string;
   copyLatestShortcut: string;
   storageDir: string;
+  aiProvider: string;
+  aiEndpoint: string;
+  aiApiKey: string;
+  aiModel: string;
 };
 
 export type WindowInfo = {
@@ -97,4 +101,8 @@ export const defaultSettings: Settings = {
   historyShortcut: "Super+Shift+KeyH",
   copyLatestShortcut: "",
   storageDir: "",
+  aiProvider: "deepseek",
+  aiEndpoint: "https://api.deepseek.com/v1",
+  aiApiKey: "",
+  aiModel: "deepseek-v4-flash",
 };

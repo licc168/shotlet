@@ -94,10 +94,21 @@ pub fn cancel_request() {
 pub struct ScrollStatus {
     pub height: u32,
     pub reverse: bool,
+    pub auto: bool,
+    pub can_auto: bool,
 }
 
 pub fn status() -> ScrollStatus {
-    ScrollStatus { height: scroll::progress(), reverse: scroll::reversed() }
+    ScrollStatus {
+        height: scroll::progress(),
+        reverse: scroll::reversed(),
+        auto: scroll::auto_enabled(),
+        can_auto: scroll::can_auto(),
+    }
+}
+
+pub fn set_auto(on: bool) {
+    scroll::set_auto(on);
 }
 
 pub fn take_action() -> String {

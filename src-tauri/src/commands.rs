@@ -949,6 +949,83 @@ pub async fn ocr_png_raw(request: tauri::ipc::Request<'_>) -> Result<String, Str
         .map_err(err)?
 }
 
+#[derive(serde::Serialize)]
+pub struct OcrLineView {
+    text: String,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// OCR lines with boxes, in the PNG's pixel space. Nothing is copied to the clipboard.
+#[tauri::command]
+pub async fn ocr_lines_raw(request: tauri::ipc::Request<'_>) -> Result<Vec<OcrLineView>, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.to_vec(),
+        _ => return Err("expected raw PNG bytes".into()),
+    };
+    let lines = tauri::async_runtime::spawn_blocking(move || library::recognize_line_boxes(&bytes))
+        .await
+        .map_err(err)??;
+    Ok(lines
+        .into_iter()
+        .map(|line| OcrLineView { text: line.text, x: line.x, y: line.y, w: line.w, h: line.h })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn ai_models(config: crate::ai::AiConfig) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::ai::list_models(&config))
+        .await
+        .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn ai_test(config: crate::ai::AiConfig) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::ai::test_connection(&config))
+        .await
+        .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn ai_see(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.to_vec(),
+        _ => return Err("expected raw PNG bytes".into()),
+    };
+    let mode = request
+        .headers()
+        .get("x-shotlet-see")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("translate")
+        .to_string();
+    let settings = ui::read_settings(&app)?;
+    let config = crate::ai::AiConfig {
+        provider: settings.ai_provider,
+        endpoint: settings.ai_endpoint,
+        api_key: settings.ai_api_key,
+        model: settings.ai_model,
+    };
+    tauri::async_runtime::spawn_blocking(move || crate::ai::see(&config, &bytes, &mode))
+        .await
+        .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn ai_translate(app: AppHandle, text: String) -> Result<String, String> {
+    let settings = ui::read_settings(&app)?;
+    let config = crate::ai::AiConfig {
+        provider: settings.ai_provider,
+        endpoint: settings.ai_endpoint,
+        api_key: settings.ai_api_key,
+        model: settings.ai_model,
+    };
+    tauri::async_runtime::spawn_blocking(move || crate::ai::translate(&config, &text))
+        .await
+        .map_err(err)?
+}
+
 #[tauri::command]
 pub fn open_editor_record(app: AppHandle, id: String) -> Result<(), String> {
     let session = editor::from_history(&storage(&app)?, &id)?;
@@ -974,6 +1051,11 @@ pub fn scroll_cancel() {
 #[tauri::command]
 pub fn scroll_progress() -> ScrollStatus {
     scroll_session::status()
+}
+
+#[tauri::command]
+pub fn set_scroll_auto(enabled: bool) {
+    scroll_session::set_auto(enabled);
 }
 
 #[tauri::command]
